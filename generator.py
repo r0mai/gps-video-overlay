@@ -18,6 +18,7 @@ class VideoMetadata:
     fps: float
     duration: float
     bitrate: int
+    frame_count: int  # Exact number of frames in the video
 
 @dataclass
 class GPSTrackPoint:
@@ -94,6 +95,7 @@ def extract_video_metadata(video_path):
             - fps: Frames per second
             - duration: Video duration in seconds
             - bitrate: Video bitrate in bits per second
+            - frame_count: Exact number of frames in the video
     """
     try:
         # Get video stream information
@@ -103,13 +105,19 @@ def extract_video_metadata(video_path):
         if video_stream is None:
             raise ValueError("No video stream found in the file")
         
+        # Get exact frame count if available, otherwise calculate it
+        frame_count = int(video_stream.get('nb_frames', 0))
+        if frame_count == 0:
+            frame_count = int(float(probe['format']['duration']) * eval(video_stream['r_frame_rate']))
+        
         # Create and return VideoMetadata object
         return VideoMetadata(
             width=int(video_stream['width']),
             height=int(video_stream['height']),
             fps=eval(video_stream['r_frame_rate']),  # Convert fraction string to float
             duration=float(probe['format']['duration']),
-            bitrate=int(probe['format']['bit_rate'])
+            bitrate=int(probe['format']['bit_rate']),
+            frame_count=frame_count
         )
     
     except ffmpeg.Error as e:
@@ -158,8 +166,14 @@ def generate_frames(
         y = int((1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1])
         return (x, y)
     
-    # Generate frames
-    for frame_num in range(int(video_metadata.duration * video_metadata.fps)):
+    # Add GPS data overlay
+    try:
+        font = ImageFont.truetype("DejaVuSans.ttf", 24)
+    except:
+        font = ImageFont.load_default()
+    
+    # Generate frames using exact frame count
+    for frame_num in range(video_metadata.frame_count):
         # Calculate timestamp for this frame
         frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
         
@@ -182,12 +196,6 @@ def generate_frames(
             outline='white',
             width=2
         )
-        
-        # Add GPS data overlay
-        try:
-            font = ImageFont.truetype("DejaVuSans.ttf", 24)
-        except:
-            font = ImageFont.load_default()
             
         # Add GPS information
         info_text = [
