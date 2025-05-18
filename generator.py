@@ -128,6 +128,7 @@ def extract_video_metadata(video_path):
         # Get exact frame count if available, otherwise calculate it
         frame_count = int(video_stream.get('nb_frames', 0))
         if frame_count == 0:
+            print("Warn: calculating frame count from duration and framerate")
             frame_count = int(float(probe['format']['duration']) * eval(video_stream['r_frame_rate']))
         
         # Create and return VideoMetadata object
@@ -323,140 +324,140 @@ def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
     speed = distance / time_diff
     return speed
 
-def composite_video_with_map(metadata: VideoMetadata, video_path: str, map_frames_dir: str, output_path: str, max_duration: float = None) -> None:
+def composite_video_with_map(metadata: VideoMetadata, video_path: str, map_frames_dir: str, output_path: str, max_duration: float = None, offset_seconds: float = 0.0) -> None:
     """
     Composite the original video with the map frames using ffmpeg.
-    
+
     Args:
+        metadata: Metadata of the original video
         video_path: Path to the original video file
         map_frames_dir: Directory containing the map frames
         output_path: Path where the final video will be saved
+        max_duration: Maximum duration of the output video in seconds (optional)
+        offset_seconds: Time offset (in seconds) for the overlay. Positive values delay the
+                        overlay (it starts later than the video) while negative values advance
+                        the overlay (it starts earlier than the video).
+
+    Behaviour for gaps created by the offset:
+        • If the offset is positive, the first overlay frame will be repeated until the actual
+          overlay sequence starts.
+        • If the offset is negative, the last overlay frame will be repeated after the overlay
+          sequence ends so the overlay is visible for the whole video.
     """
     try:
-        # Get the frame pattern for the map frames
+        # Pattern of the generated PNG frames
         frame_pattern = os.path.join(map_frames_dir, "frame_%06d.png")
-        
-        # Get video duration for progress calculation
+
+        # Duration of the final composition (may be limited by max_duration)
         duration = min(metadata.duration, max_duration) if max_duration else metadata.duration
-        
-        # Verify input files exist
+
+        # Sanity checks
         if not os.path.exists(video_path):
             raise FileNotFoundError(f"Video file not found: {video_path}")
-        if not os.path.exists(map_frames_dir):
+        if not os.path.isdir(map_frames_dir):
             raise FileNotFoundError(f"Map frames directory not found: {map_frames_dir}")
-            
-        # Check if we have any map frames
-        map_frames = [f for f in os.listdir(map_frames_dir) if f.startswith('frame_') and f.endswith('.png')]
-        if not map_frames:
+        if not any(f.startswith("frame_") and f.endswith(".png") for f in os.listdir(map_frames_dir)):
             raise FileNotFoundError(f"No map frames found in {map_frames_dir}")
-            
-        print(f"Found {len(map_frames)} map frames")
-        
-        # Construct ffmpeg command to overlay map frames on video
+
+        # Build FFmpeg filter graph
+        video_in = ffmpeg.input(video_path)
+        # Provide an explicit frame rate so ffmpeg doesn't mis-detect it from the image sequence
+        overlay_in = ffmpeg.input(frame_pattern, framerate=metadata.fps, thread_queue_size=512, start_number=0)
+
+        # Positive offset (delay): duplicate the first frame so that it "fills" the gap
+        if offset_seconds > 0:
+            # tpad with start_mode=clone will clone the first frame for the requested duration
+            overlay_in = overlay_in.filter('tpad', start_duration=offset_seconds, start_mode='clone')
+        # Negative offset (advance): shift PTS earlier so the overlay starts sooner
+        elif offset_seconds < 0:
+            # setpts shifts timestamps. Note: offset_seconds is negative here.
+            overlay_in = overlay_in.filter('setpts', f"PTS+{offset_seconds}/TB")
+        # (offset == 0) -> no change needed
+
+        # Now overlay the two streams. eof_action=repeat makes the last overlay frame persist
+        composed = ffmpeg.overlay(video_in, overlay_in, x=10, y=10, eof_action='repeat')
+
+        # Final output command
         stream = (
             ffmpeg
-            .input(video_path)
-            .overlay(
-                ffmpeg.input(frame_pattern, thread_queue_size=512),  # Increase queue size for frame reading
-                x=10,  # 10px margin from left
-                y=10   # 10px margin from top
-            )
             .output(
+                composed,
                 output_path,
                 t=duration,
-                progress='pipe:1',  # Output progress to stdout
-                loglevel='warning',  # Show warnings and errors
+                progress='pipe:1',  # Print progress to stdout
+                loglevel='warning'   # Show warnings and errors only
             )
             .overwrite_output()
         )
-        
-        # Run the ffmpeg command and capture progress
+
+        # Run ffmpeg asynchronously so we can parse the progress
         process = stream.run_async(pipe_stdout=True, pipe_stderr=True)
-        
-        # Process ffmpeg output to show progress
-        last_progress = 0
-        stall_count = 0
-        
-        # Set up non-blocking reads
-        stdout_fd = process.stdout.fileno()
-        stderr_fd = process.stderr.fileno()
-        
-        # Set up line buffers
-        stdout_buffer = ""
-        stderr_buffer = ""
-        
+
+        last_progress = -1.0  # Track progress percentage
+        stall_counter = 0
+
+        # Non-blocking I/O setup
+        fds = {process.stdout.fileno(): process.stdout, process.stderr.fileno(): process.stderr}
+        buffers = {fd: "" for fd in fds}
+
         while True:
-            # Check if process has finished
             if process.poll() is not None:
-                break
-                
-            # Use select to check for available data
-            reads = [stdout_fd, stderr_fd]
-            ret = select.select(reads, [], [], 0.1)  # 0.1 second timeout
-            
-            if not ret[0]:  # No data available
+                break  # Process finished
+
+            # Wait briefly for data on either descriptor
+            ready_fds, _, _ = select.select(list(fds.keys()), [], [], 0.1)
+            if not ready_fds:
                 continue
-                
-            # Read from stdout
-            if stdout_fd in ret[0]:
-                data = os.read(stdout_fd, 1024).decode('utf8', errors='replace')
-                if not data:  # EOF
-                    continue
-                stdout_buffer += data
-                
+
+            for fd in ready_fds:
+                data = os.read(fd, 1024).decode('utf-8', errors='replace')
+                if not data:
+                    continue  # EOF
+                buffers[fd] += data
+
                 # Process complete lines
-                while '\n' in stdout_buffer:
-                    line, stdout_buffer = stdout_buffer.split('\n', 1)
-                    if 'time=' in line:
+                while '\n' in buffers[fd]:
+                    line, buffers[fd] = buffers[fd].split('\n', 1)
+                    line = line.strip()
+
+                    # stdout contains key=value pairs when -progress pipe is used
+                    if fd == process.stdout.fileno() and line.startswith('out_time_ms'):
                         try:
-                            time_str = line.split('time=')[1].split()[0]
-                            h, m, s = time_str.split(':')
-                            current_time = float(h) * 3600 + float(m) * 60 + float(s)
-                            progress = (current_time / duration) * 100
-                            
-                            # Check for stalled progress
-                            if progress == last_progress:
-                                stall_count += 1
-                                if stall_count > 10:  # If stalled for 10 updates
-                                    print(f"\nWarning: Progress stalled at {progress:.1f}%")
+                            # out_time_ms is the current time of the output in microseconds
+                            time_us = int(line.split('=')[1])
+                            current_sec = time_us / 1_000_000.0
+                            progress_pct = (current_sec / duration) * 100.0
+
+                            if progress_pct == last_progress:
+                                stall_counter += 1
+                                if stall_counter > 20:
+                                    print(f"\nWarning: ffmpeg progress seems stalled at {progress_pct:.1f}%")
                             else:
-                                stall_count = 0
-                                
-                            last_progress = progress
-                            print(f"\rCompositing video: {progress:.1f}%", end='', flush=True)
-                        except Exception as e:
-                            print(f"\nError parsing progress: {str(e)}")
-            
-            # Read from stderr
-            if stderr_fd in ret[0]:
-                data = os.read(stderr_fd, 1024).decode('utf8', errors='replace')
-                if not data:  # EOF
-                    continue
-                stderr_buffer += data
-                
-                # Process complete lines
-                while '\n' in stderr_buffer:
-                    line, stderr_buffer = stderr_buffer.split('\n', 1)
-                    print(f"\nFFmpeg (err): {line.strip()}")
-        
-        # Process any remaining data in buffers
-        if stdout_buffer:
-            print(f"\nFFmpeg (out): {stdout_buffer.strip()}")
-        if stderr_buffer:
-            print(f"\nFFmpeg (err): {stderr_buffer.strip()}")
-        
-        # Wait for process to complete and check return code
-        return_code = process.wait()
-        if return_code != 0:
-            raise Exception(f"FFmpeg process failed with return code {return_code}")
-            
+                                stall_counter = 0
+                            last_progress = progress_pct
+                            print(f"\rCompositing video: {progress_pct:.1f}%", end='', flush=True)
+                        except Exception:
+                            # Ignore parsing errors, just continue
+                            pass
+                    elif fd == process.stderr.fileno():
+                        # Print ffmpeg warnings/errors verbosely
+                        if line:
+                            print(f"\nFFmpeg (err): {line}")
+
+        # Flush remaining buffer content
+        for fd, buf in buffers.items():
+            if buf.strip():
+                channel = "out" if fd == process.stdout.fileno() else "err"
+                print(f"\nFFmpeg ({channel}): {buf.strip()}")
+
+        ret_code = process.wait()
+        if ret_code != 0:
+            raise RuntimeError(f"FFmpeg exited with status {ret_code}")
+
         print(f"\nComposited video saved to: {output_path}")
-        
-    except ffmpeg.Error as e:
-        print(f"\nFFmpeg error output: {e.stderr.decode() if e.stderr else 'No error output'}")
-        raise Exception(f"Error compositing video: {str(e)}")
-    except Exception as e:
-        raise Exception(f"Unexpected error during video composition: {str(e)}")
+
+    except Exception as exc:
+        raise Exception(f"Unexpected error during video composition: {exc}") from exc
 
 def main():
     # Set up argument parser
@@ -466,6 +467,7 @@ def main():
     parser.add_argument('--output-dir', required=True, help='Directory to save generated frames')
     parser.add_argument('--skip-generation', action='store_true', default=False, help='Skip generation of frames')
     parser.add_argument('--max-duration', type=float, help='Maximum duration of the output video in seconds')
+    parser.add_argument('--offset-seconds', type=float, default=0, help='Offset in seconds for the overlay layer (positive = delay, negative = advance)')
     # Parse arguments
     args = parser.parse_args()
     
@@ -492,7 +494,8 @@ def main():
             video_path=args.video_file,
             map_frames_dir=map_output_dir,
             output_path=output_video,
-            max_duration=args.max_duration
+            max_duration=args.max_duration,
+            offset_seconds=args.offset_seconds
         )
             
     except Exception as e:
