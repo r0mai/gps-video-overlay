@@ -2,6 +2,16 @@
 
 import ffmpeg
 import argparse
+from dataclasses import dataclass
+
+@dataclass
+class VideoMetadata:
+    """Class representing video metadata."""
+    width: int
+    height: int
+    fps: float
+    duration: float
+    bitrate: int
 
 def extract_video_metadata(video_path):
     """
@@ -11,7 +21,7 @@ def extract_video_metadata(video_path):
         video_path (str): Path to the MP4 video file
         
     Returns:
-        dict: Dictionary containing video metadata including:
+        VideoMetadata: Object containing video metadata including:
             - width: Video width in pixels
             - height: Video height in pixels
             - fps: Frames per second
@@ -26,16 +36,14 @@ def extract_video_metadata(video_path):
         if video_stream is None:
             raise ValueError("No video stream found in the file")
         
-        # Extract relevant metadata
-        metadata = {
-            'width': int(video_stream['width']),
-            'height': int(video_stream['height']),
-            'fps': eval(video_stream['r_frame_rate']),  # Convert fraction string to float
-            'duration': float(probe['format']['duration']),
-            'bitrate': int(probe['format']['bit_rate'])
-        }
-        
-        return metadata
+        # Create and return VideoMetadata object
+        return VideoMetadata(
+            width=int(video_stream['width']),
+            height=int(video_stream['height']),
+            fps=eval(video_stream['r_frame_rate']),  # Convert fraction string to float
+            duration=float(probe['format']['duration']),
+            bitrate=int(probe['format']['bit_rate'])
+        )
     
     except ffmpeg.Error as e:
         raise Exception(f"Error processing video file: {str(e)}")
@@ -53,10 +61,10 @@ def main():
     try:
         metadata = extract_video_metadata(args.video_path)
         print("Video Metadata:")
-        print(f"Resolution: {metadata['width']}x{metadata['height']}")
-        print(f"Frame Rate: {metadata['fps']} fps")
-        print(f"Duration: {metadata['duration']:.2f} seconds")
-        print(f"Bitrate: {metadata['bitrate'] / 1000:.2f} kbps")
+        print(f"Resolution: {metadata.width}x{metadata.height}")
+        print(f"Frame Rate: {metadata.fps} fps")
+        print(f"Duration: {metadata.duration:.2f} seconds")
+        print(f"Bitrate: {metadata.bitrate / 1000:.2f} kbps")
     except Exception as e:
         print(f"Error: {str(e)}")
 
