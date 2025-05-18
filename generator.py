@@ -13,6 +13,8 @@ import bisect
 import os
 from multiprocessing import Pool, cpu_count
 from functools import partial
+import select
+import sys
 
 @dataclass
 class VideoMetadata:
@@ -334,25 +336,125 @@ def composite_video_with_map(video_path: str, map_frames_dir: str, output_path: 
         # Get the frame pattern for the map frames
         frame_pattern = os.path.join(map_frames_dir, "frame_%06d.png")
         
+        # Get video duration for progress calculation
+        probe = ffmpeg.probe(video_path)
+        duration = float(probe['format']['duration'])
+        
+        # Verify input files exist
+        if not os.path.exists(video_path):
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+        if not os.path.exists(map_frames_dir):
+            raise FileNotFoundError(f"Map frames directory not found: {map_frames_dir}")
+            
+        # Check if we have any map frames
+        map_frames = [f for f in os.listdir(map_frames_dir) if f.startswith('frame_') and f.endswith('.png')]
+        if not map_frames:
+            raise FileNotFoundError(f"No map frames found in {map_frames_dir}")
+            
+        print(f"Found {len(map_frames)} map frames")
+        
         # Construct ffmpeg command to overlay map frames on video
         stream = (
             ffmpeg
             .input(video_path)
             .overlay(
-                ffmpeg.input(frame_pattern),
+                ffmpeg.input(frame_pattern, thread_queue_size=512),  # Increase queue size for frame reading
                 x=10,  # 10px margin from left
                 y=10   # 10px margin from top
             )
-            .output(output_path)
+            .output(
+                output_path,
+                progress='pipe:1',  # Output progress to stdout
+                loglevel='warning',  # Show warnings and errors
+            )
             .overwrite_output()
         )
         
-        # Run the ffmpeg command
-        stream.run(capture_stdout=True, capture_stderr=True)
+        # Run the ffmpeg command and capture progress
+        process = stream.run_async(pipe_stdout=True, pipe_stderr=True)
+        
+        # Process ffmpeg output to show progress
+        last_progress = 0
+        stall_count = 0
+        
+        # Set up non-blocking reads
+        stdout_fd = process.stdout.fileno()
+        stderr_fd = process.stderr.fileno()
+        
+        # Set up line buffers
+        stdout_buffer = ""
+        stderr_buffer = ""
+        
+        while True:
+            # Check if process has finished
+            if process.poll() is not None:
+                break
+                
+            # Use select to check for available data
+            reads = [stdout_fd, stderr_fd]
+            ret = select.select(reads, [], [], 0.1)  # 0.1 second timeout
+            
+            if not ret[0]:  # No data available
+                continue
+                
+            # Read from stdout
+            if stdout_fd in ret[0]:
+                data = os.read(stdout_fd, 1024).decode('utf8', errors='replace')
+                if not data:  # EOF
+                    continue
+                stdout_buffer += data
+                
+                # Process complete lines
+                while '\n' in stdout_buffer:
+                    line, stdout_buffer = stdout_buffer.split('\n', 1)
+                    if 'time=' in line:
+                        try:
+                            time_str = line.split('time=')[1].split()[0]
+                            h, m, s = time_str.split(':')
+                            current_time = float(h) * 3600 + float(m) * 60 + float(s)
+                            progress = (current_time / duration) * 100
+                            
+                            # Check for stalled progress
+                            if progress == last_progress:
+                                stall_count += 1
+                                if stall_count > 10:  # If stalled for 10 updates
+                                    print(f"\nWarning: Progress stalled at {progress:.1f}%")
+                            else:
+                                stall_count = 0
+                                
+                            last_progress = progress
+                            print(f"\rCompositing video: {progress:.1f}%", end='', flush=True)
+                        except Exception as e:
+                            print(f"\nError parsing progress: {str(e)}")
+            
+            # Read from stderr
+            if stderr_fd in ret[0]:
+                data = os.read(stderr_fd, 1024).decode('utf8', errors='replace')
+                if not data:  # EOF
+                    continue
+                stderr_buffer += data
+                
+                # Process complete lines
+                while '\n' in stderr_buffer:
+                    line, stderr_buffer = stderr_buffer.split('\n', 1)
+                    print(f"\nFFmpeg (err): {line.strip()}")
+        
+        # Process any remaining data in buffers
+        if stdout_buffer:
+            print(f"\nFFmpeg (out): {stdout_buffer.strip()}")
+        if stderr_buffer:
+            print(f"\nFFmpeg (err): {stderr_buffer.strip()}")
+        
+        # Wait for process to complete and check return code
+        return_code = process.wait()
+        if return_code != 0:
+            raise Exception(f"FFmpeg process failed with return code {return_code}")
+            
         print(f"\nComposited video saved to: {output_path}")
         
     except ffmpeg.Error as e:
-        raise Exception(f"Error compositing video: {str(e.stderr.decode())}")
+        print(f"\nFFmpeg error output: {e.stderr.decode() if e.stderr else 'No error output'}")
+        raise Exception(f"Error compositing video: {str(e)}")
     except Exception as e:
         raise Exception(f"Unexpected error during video composition: {str(e)}")
 
