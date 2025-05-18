@@ -505,7 +505,8 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
             base_in.video,
             overlay_video,
             x=10,
-            y="main_h-overlay_h-10",
+            y=10,
+            # y="main_h-overlay_h-10",
             format="auto",  # let FFmpeg choose the correct format (keeps alpha)
             eof_action="pass",  # when overlay ends, continue showing base video
         )
