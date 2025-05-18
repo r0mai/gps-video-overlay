@@ -493,11 +493,26 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
 
         overlay_video = overlay_in.video  # isolate the video stream
 
-        if offset_seconds != 0:
-            # `PTS+X/TB` delays (or advances if X < 0) the overlay by X
-            # seconds.  See FFmpeg docs for `setpts`.
-            setpts_expr = f"PTS+{offset_seconds}/TB"
-            overlay_video = overlay_video.filter("setpts", setpts_expr)
+        # If an offset is requested we either:
+        #  • Positive offset  -> freeze the first frame for `offset_seconds`
+        #  • Negative offset  -> start the overlay earlier by shifting PTS
+        # In both cases we keep the last frame visible afterwards by using
+        # `eof_action=repeat` later in the overlay filter.
+        if offset_seconds > 0:
+            # Clone the first frame so that it is displayed until the overlay
+            # actually starts moving.
+            overlay_video = overlay_video.filter(
+                "tpad",
+                start_duration=offset_seconds,
+                start_mode="clone",
+            )
+        elif offset_seconds < 0:
+            # Advance the overlay timeline; frames that would fall before
+            # t=0 are discarded automatically by FFmpeg.
+            overlay_video = overlay_video.filter(
+                "setpts",
+                f"PTS+{offset_seconds}/TB",  # note: offset_seconds is negative here
+            )
 
         # Position the overlay 10px from the left and 10px from the bottom.
         # `main_h-overlay_h-10` keeps the overlay anchored to the bottom.
@@ -508,7 +523,7 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
             y=10,
             # y="main_h-overlay_h-10",
             format="auto",  # let FFmpeg choose the correct format (keeps alpha)
-            eof_action="pass",  # when overlay ends, continue showing base video
+            eof_action="repeat",  # when overlay ends, repeat the last frame
         )
 
         # Detect whether the base video contains an audio stream – if not we
