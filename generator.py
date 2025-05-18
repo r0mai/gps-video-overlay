@@ -11,6 +11,7 @@ import os
 from typing import List
 import bisect
 import os
+from multiprocessing import Pool, cpu_count
 
 @dataclass
 class VideoMetadata:
@@ -32,6 +33,19 @@ class GPSTrackPoint:
     timestamp: datetime
     fix_type: str
     pdop: float
+
+@dataclass
+class FrameParams:
+    """Parameters needed for generating a single frame."""
+    frame_num: int
+    frame_time: datetime
+    track_points: List[GPSTrackPoint]
+    map_size: tuple
+    min_lat: float
+    max_lat: float
+    min_lon: float
+    max_lon: float
+    font: ImageFont.FreeTypeFont
 
 def parse_gpx_file(gpx_path: str) -> list[GPSTrackPoint]:
     """
@@ -129,6 +143,74 @@ def extract_video_metadata(video_path):
     except Exception as e:
         raise Exception(f"Unexpected error: {str(e)}")
 
+def generate_single_frame(params: FrameParams) -> tuple[int, Image.Image]:
+    """
+    Generate a single frame with GPS visualization.
+    
+    Args:
+        params: FrameParams object containing all necessary parameters
+        
+    Returns:
+        Tuple of (frame_num, frame_image)
+    """
+    def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
+        """Convert latitude/longitude to pixel coordinates."""
+        x = int((lon - params.min_lon) / (params.max_lon - params.min_lon) * params.map_size[0])
+        y = int((1 - (lat - params.min_lat) / (params.max_lat - params.min_lat)) * params.map_size[1])
+        return (x, y)
+    
+    # Find the closest GPS point to this timestamp using bisect
+    timestamps = [p.timestamp for p in params.track_points]
+    closest_idx = bisect.bisect_left(timestamps, params.frame_time)
+    
+    # Handle edge cases
+    if closest_idx == len(params.track_points):
+        closest_idx = len(params.track_points) - 1
+    else:
+        # Compare with previous point to find closest
+        if abs((params.track_points[closest_idx].timestamp - params.frame_time).total_seconds()) >= \
+           abs((params.track_points[closest_idx-1].timestamp - params.frame_time).total_seconds()):
+            closest_idx = closest_idx - 1
+
+    closest_point = params.track_points[closest_idx]
+    
+    # Create a new image for the map
+    map_image = Image.new('RGBA', params.map_size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(map_image)
+    
+    # Draw the complete track
+    track_points_pixels = [lat_lon_to_pixel(p.latitude, p.longitude) for p in params.track_points]
+    draw.line(track_points_pixels, fill='blue', width=2)
+    
+    # Draw the current position
+    current_pos = lat_lon_to_pixel(closest_point.latitude, closest_point.longitude)
+    draw.ellipse(
+        (current_pos[0]-8, current_pos[1]-8, current_pos[0]+8, current_pos[1]+8),
+        fill='red',
+        outline='white',
+        width=2
+    )
+    
+    # Add GPS information
+    info_text = [
+        f"Lat: {closest_point.latitude:.6f}°",
+        f"Lon: {closest_point.longitude:.6f}°",
+        f"Elev: {closest_point.elevation:.1f}m",
+        f"Speed: {calculate_speed(closest_idx, params.track_points):.1f} km/h",
+        f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
+    ]
+    
+    # Draw text with black outline for better visibility
+    for i, text in enumerate(info_text):
+        y_pos = 10 + i * 30
+        # Draw black outline
+        for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+            draw.text((12 + offset_x, y_pos + offset_y), text, font=params.font, fill='black')
+        # Draw white text
+        draw.text((12, y_pos), text, font=params.font, fill='white')
+    
+    return params.frame_num, map_image
+
 def generate_map_frames(
     video_metadata: VideoMetadata,
     track_points: List[GPSTrackPoint],
@@ -136,7 +218,7 @@ def generate_map_frames(
     map_size: tuple = (800, 600)
 ) -> None:
     """
-    Generate PNG frames with GPS path visualization.
+    Generate PNG frames with GPS path visualization using parallel processing.
     
     Args:
         video_metadata: Video metadata containing resolution and fps
@@ -164,82 +246,40 @@ def generate_map_frames(
     min_lon -= lon_padding
     max_lon += lon_padding
     
-    def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
-        """Convert latitude/longitude to pixel coordinates."""
-        x = int((lon - min_lon) / (max_lon - min_lon) * map_size[0])
-        y = int((1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1])
-        return (x, y)
-    
-    # Add GPS data overlay
+    # Load font once
     try:
         font = ImageFont.truetype("DejaVuSans.ttf", 24)
     except:
         font = ImageFont.load_default()
     
-    # Generate frames using exact frame count
+    # Prepare frame parameters for parallel processing
     total_frames = video_metadata.frame_count
+    frame_params = []
     for frame_num in range(total_frames):
-        # Print progress indicator
-        progress = (frame_num + 1) / total_frames * 100
-        print(f"\rGenerating frame {frame_num + 1}/{total_frames} ({progress:.1f}%)", end='', flush=True)
-        
-        # Calculate timestamp for this frame
         frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
-        
-        # Find the closest GPS point to this timestamp using bisect
-        timestamps = [p.timestamp for p in track_points]
-        closest_idx = bisect.bisect_left(timestamps, frame_time)
-        
-        # Handle edge cases
-        if closest_idx == len(track_points):
-            closest_idx = len(track_points) - 1
-        else:
-            # Compare with previous point to find closest
-            if abs((track_points[closest_idx].timestamp - frame_time).total_seconds()) >= \
-               abs((track_points[closest_idx-1].timestamp - frame_time).total_seconds()):
-                closest_idx = closest_idx - 1
-
-        closest_point = track_points[closest_idx]
-        
-        # Create a new image for the map
-        map_image = Image.new('RGBA', map_size, (0, 0, 0, 0))
-        draw = ImageDraw.Draw(map_image)
-        
-        # Draw the complete track
-        track_points_pixels = [lat_lon_to_pixel(p.latitude, p.longitude) for p in track_points]
-        draw.line(track_points_pixels, fill='blue', width=2)
-        
-        # Draw the current position
-        current_pos = lat_lon_to_pixel(closest_point.latitude, closest_point.longitude)
-        draw.ellipse(
-            (current_pos[0]-8, current_pos[1]-8, current_pos[0]+8, current_pos[1]+8),
-            fill='red',
-            outline='white',
-            width=2
+        params = FrameParams(
+            frame_num=frame_num,
+            frame_time=frame_time,
+            track_points=track_points,
+            map_size=map_size,
+            min_lat=min_lat,
+            max_lat=max_lat,
+            min_lon=min_lon,
+            max_lon=max_lon,
+            font=font
         )
-        
-        # Add GPS information
-        info_text = [
-            f"Lat: {closest_point.latitude:.6f}°",
-            f"Lon: {closest_point.longitude:.6f}°",
-            f"Elev: {closest_point.elevation:.1f}m",
-            f"Speed: {calculate_speed(closest_idx, track_points):.1f} km/h",
-            f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
-        ]
-        
-        # Draw text with black outline for better visibility
-        for i, text in enumerate(info_text):
-            y_pos = 10 + i * 30
-            # Draw black outline
-            for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-                draw.text((12 + offset_x, y_pos + offset_y), text, font=font, fill='black')
-            # Draw white text
-            draw.text((12, y_pos), text, font=font, fill='white')
-        
-        # Save the frame
-        map_image.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
+        frame_params.append(params)
     
-    # Print newline after completion
+    # Use multiprocessing to generate frames
+    num_processes = max(1, cpu_count() - 1)  # Leave one CPU free
+    print(f"Generating frames using {num_processes} processes...")
+    
+    with Pool(num_processes) as pool:
+        for frame_num, frame_image in pool.imap_unordered(generate_single_frame, frame_params):
+            frame_image.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
+            progress = (frame_num + 1) / total_frames * 100
+            print(f"\rProgress: {progress:.1f}%", end='', flush=True)
+    
     print()  # Add newline after progress is complete
 
 def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
