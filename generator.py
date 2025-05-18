@@ -324,23 +324,32 @@ def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
     speed = distance / time_diff
     return speed
 
+# ---------------------------------------------------------------------------
+# Video overlay generation (transparent MOV)                                |
+# ---------------------------------------------------------------------------
+
 def generate_map_video(
     video_metadata: VideoMetadata,
     track_points: List[GPSTrackPoint],
     output_path: str,
-    map_size: tuple = (800, 600)
+    map_size: tuple = (800, 600),
+    overlay_fps: float = 5.0,
 ) -> None:
     """
-    Generate a transparent video with GPS path visualization using parallel processing.
+    Generate a transparent video with GPS path visualization.
     
     Args:
         video_metadata: Video metadata containing resolution and fps
         track_points: List of GPS track points
         output_path: Path to save the generated video
         map_size: Size of the visualization in pixels (default: 800x600)
+        overlay_fps: Frame rate (frames per second) for the generated overlay video
     """
-    # Calculate frame duration
-    frame_duration = 1.0 / video_metadata.fps
+    # Calculate frame duration based on *overlay* fps (not the base video fps)
+    if overlay_fps <= 0:
+        raise ValueError("overlay_fps must be greater than zero")
+
+    frame_duration = 1.0 / overlay_fps
     
     # Calculate bounds of the track
     min_lat = min(p.latitude for p in track_points)
@@ -362,18 +371,33 @@ def generate_map_video(
     except:
         font = ImageFont.load_default()
 
-    # Start FFmpeg process to encode the video
+    # Determine how many frames to generate so that the overlay spans the full
+    # duration of the base video (rounded up so we cover the tail).
+    total_frames = int(video_metadata.duration * overlay_fps + 0.5)
+
+    # Start FFmpeg process to encode the overlay video at the requested fps
     process = (
         ffmpeg
-        .input('pipe:', format='rawvideo', pix_fmt='rgba', s=f'{map_size[0]}x{map_size[1]}', r=video_metadata.fps)
-        .output(output_path, vcodec='prores_ks', profile='4444', pix_fmt='yuva444p10le')
+        .input(
+            'pipe:',
+            format='rawvideo',
+            pix_fmt='rgba',
+            s=f'{map_size[0]}x{map_size[1]}',
+            r=overlay_fps,
+        )
+        .output(
+            output_path,
+            vcodec='prores_ks',
+            profile='4444',
+            pix_fmt='yuva444p10le',
+            r=overlay_fps,
+        )
         .overwrite_output()
         .run_async(pipe_stdin=True)
     )
 
     try:
         # Generate frames sequentially and write them to the pipe
-        total_frames = video_metadata.frame_count
         for frame_num in range(total_frames):
             frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
             
@@ -613,7 +637,8 @@ def main():
                 video_metadata=metadata,
                 track_points=track_points,
                 output_path=overlay_video_path,
-                map_size=map_size
+                map_size=map_size,
+                overlay_fps=1.0,
             )
         
         # Composite the video with overlay
