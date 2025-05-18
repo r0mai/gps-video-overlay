@@ -323,7 +323,7 @@ def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
     speed = distance / time_diff
     return speed
 
-def composite_video_with_map(video_path: str, map_frames_dir: str, output_path: str) -> None:
+def composite_video_with_map(metadata: VideoMetadata, video_path: str, map_frames_dir: str, output_path: str, max_duration: float = None) -> None:
     """
     Composite the original video with the map frames using ffmpeg.
     
@@ -337,8 +337,7 @@ def composite_video_with_map(video_path: str, map_frames_dir: str, output_path: 
         frame_pattern = os.path.join(map_frames_dir, "frame_%06d.png")
         
         # Get video duration for progress calculation
-        probe = ffmpeg.probe(video_path)
-        duration = float(probe['format']['duration'])
+        duration = min(metadata.duration, max_duration) if max_duration else metadata.duration
         
         # Verify input files exist
         if not os.path.exists(video_path):
@@ -364,6 +363,7 @@ def composite_video_with_map(video_path: str, map_frames_dir: str, output_path: 
             )
             .output(
                 output_path,
+                t=duration,
                 progress='pipe:1',  # Output progress to stdout
                 loglevel='warning',  # Show warnings and errors
             )
@@ -465,7 +465,7 @@ def main():
     parser.add_argument('--gps-file', required=True, help='Path to the GPX file')
     parser.add_argument('--output-dir', required=True, help='Directory to save generated frames')
     parser.add_argument('--skip-generation', action='store_true', default=False, help='Skip generation of frames')
-    
+    parser.add_argument('--max-duration', type=float, help='Maximum duration of the output video in seconds')
     # Parse arguments
     args = parser.parse_args()
     
@@ -488,9 +488,11 @@ def main():
         # Composite the video with map frames
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
         composite_video_with_map(
+            metadata=metadata,
             video_path=args.video_file,
             map_frames_dir=map_output_dir,
-            output_path=output_video
+            output_path=output_video,
+            max_duration=args.max_duration
         )
             
     except Exception as e:
