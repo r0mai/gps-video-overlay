@@ -454,137 +454,123 @@ def generate_map_video(
         process.wait()
         raise Exception(f"Error generating overlay video: {str(e)}")
 
-def composite_video_with_map(metadata: VideoMetadata, video_path: str, overlay_video_path: str, output_path: str, max_duration: float = None, offset_seconds: float = 0.0) -> None:
+def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overlay_video_path: str, output_path: str, max_duration: float = None, offset_seconds: float = 0.0) -> None:
     """
-    Composite the original video with the overlay video using ffmpeg.
+    Composite the original video with the overlay video using FFmpeg.
 
-    Args:
-        metadata: Metadata of the original video
-        video_path: Path to the original video file
-        overlay_video_path: Path to the overlay video file
-        output_path: Path where the final video will be saved
-        max_duration: Maximum duration of the output video in seconds (optional)
-        offset_seconds: Time offset (in seconds) for the overlay layer (positive = delay, negative = advance)
+    The function will place the (usually smaller) overlay video on top of the
+    bottom-left corner of the original clip while preserving its alpha channel.
+
+    Parameters
+    ----------
+    metadata : VideoMetadata
+        Metadata of the *original* video.  Currently only used for sanity
+        checks; supplying it keeps the call-site symmetrical with the other
+        helper functions.
+    video_path : str
+        Path to the original/base video.
+    overlay_video_path : str
+        Path to the previously generated transparent overlay video.
+    output_path : str
+        Path where the composited file will be written.
+    max_duration : float | None, optional
+        If provided the output will be trimmed/clamped to this duration (in
+        seconds).
+    offset_seconds : float, default 0.0
+        Positive values delay the overlay relative to the base video, negative
+        values advance it.  Implemented via a `setpts` filter on the overlay
+        stream.
     """
+
+    # Build FFmpeg input streams
     try:
-        # Duration of the final composition (may be limited by max_duration)
-        duration = min(metadata.duration, max_duration) if max_duration else metadata.duration
+        # Base/original clip (keep audio if present).
+        base_in = ffmpeg.input(video_path)
 
-        # Sanity checks
-        if not os.path.exists(video_path):
-            raise FileNotFoundError(f"Video file not found: {video_path}")
-        if not os.path.exists(overlay_video_path):
-            raise FileNotFoundError(f"Overlay video file not found: {overlay_video_path}")
+        # Overlay clip – video only (usually has no audio).  If the caller
+        # wants the overlay to start later/earlier we adjust its PTS.
+        overlay_in = ffmpeg.input(overlay_video_path)
 
-        # Separate variables for the original inputs
-        video_input = ffmpeg.input(video_path)
-        overlay_input = ffmpeg.input(overlay_video_path)
+        overlay_video = overlay_in.video  # isolate the video stream
 
-        # Extract video streams and reset timestamps so both start at 0
-        base_video = video_input.video.filter('setpts', 'PTS-STARTPTS')
-        overlay_video = overlay_input.video.filter('setpts', 'PTS-STARTPTS')
+        if offset_seconds != 0:
+            # `PTS+X/TB` delays (or advances if X < 0) the overlay by X
+            # seconds.  See FFmpeg docs for `setpts`.
+            setpts_expr = f"PTS+{offset_seconds}/TB"
+            overlay_video = overlay_video.filter("setpts", setpts_expr)
 
-        # Apply positive / negative offset on the overlay if requested
-        if offset_seconds > 0:
-            # Delay overlay by duplicating its first frame
-            overlay_video = overlay_video.filter('tpad', start_duration=offset_seconds, start_mode='clone')
-        elif offset_seconds < 0:
-            # Advance overlay by shifting timestamps (note: offset_seconds is negative)
-            overlay_video = overlay_video.filter('setpts', f"PTS+{offset_seconds}/TB")
-
-        # Compose the two video streams. `shortest=1` ensures encoding stops when the shorter stream ends.
-        composed = ffmpeg.overlay(base_video, overlay_video, x=10, y=10, shortest=1)
-
-        # Get audio stream (if any) from the original video
-        audio_stream = video_input.audio
-
-        # Build final output. Keep audio unchanged (copy) while encoding video layer.
-        stream = (
-            ffmpeg
-            .output(
-                composed,
-                audio_stream,
-                output_path,
-                t=duration,
-                vcodec='libx264',
-                crf=18,
-                preset='medium',
-                acodec='copy',
-                movflags='+faststart',
-                progress='pipe:1',
-                loglevel='warning'
-            )
-            .overwrite_output()
+        # Position the overlay 10px from the left and 10px from the bottom.
+        # `main_h-overlay_h-10` keeps the overlay anchored to the bottom.
+        composited = ffmpeg.overlay(
+            base_in.video,
+            overlay_video,
+            x=10,
+            y="main_h-overlay_h-10",
+            format="auto",  # let FFmpeg choose the correct format (keeps alpha)
+            eof_action="pass",  # when overlay ends, continue showing base video
         )
 
-        # Run ffmpeg asynchronously so we can parse the progress
-        process = stream.run_async(pipe_stdout=True, pipe_stderr=True)
+        # Detect whether the base video contains an audio stream – if not we
+        # must *not* try to map it in the output, otherwise FFmpeg will error
+        # out with "Stream map 'a:0' matches no streams".
+        try:
+            probe = ffmpeg.probe(video_path)
+            has_audio = any(s.get("codec_type") == "audio" for s in probe["streams"])
+        except ffmpeg.Error:
+            # In the unlikely event probing fails, assume audio exists so we
+            # at least attempt to preserve it.
+            has_audio = True
 
-        last_progress = -1.0  # Track progress percentage
-        stall_counter = 0
+        # Assemble output arguments.  We re-encode the video with H.264 for
+        # broad compatibility and copy the original audio stream (if present).
+        output_kwargs = {
+            "vcodec": "libx264",
+            "pix_fmt": "yuv420p",
+            "preset": "veryfast",
+            "crf": 23,
+            "acodec": "copy",  # keep original audio untouched
+            "movflags": "+faststart",
+        }
 
-        # Non-blocking I/O setup
-        fds = {process.stdout.fileno(): process.stdout, process.stderr.fileno(): process.stderr}
-        buffers = {fd: "" for fd in fds}
+        # Trim/limit duration if requested.
+        if max_duration is not None and max_duration > 0:
+            output_kwargs["t"] = max_duration
 
-        while True:
-            if process.poll() is not None:
-                break  # Process finished
+        # Build the final graph – video from the composited stream and, if
+        # present, audio from the base input.
+        if has_audio:
+            out_stream = (
+                ffmpeg
+                .output(
+                    composited,
+                    base_in.audio,
+                    output_path,
+                    **output_kwargs,
+                )
+                .overwrite_output()
+            )
+        else:
+            # No audio in source – only map the video stream.
+            # Remove the `acodec` setting to avoid superfluous arguments.
+            output_kwargs_no_audio = {k: v for k, v in output_kwargs.items() if k != "acodec"}
 
-            # Wait briefly for data on either descriptor
-            ready_fds, _, _ = select.select(list(fds.keys()), [], [], 0.1)
-            if not ready_fds:
-                continue
+            out_stream = (
+                ffmpeg
+                .output(
+                    composited,
+                    output_path,
+                    **output_kwargs_no_audio,
+                )
+                .overwrite_output()
+            )
 
-            for fd in ready_fds:
-                data = os.read(fd, 1024).decode('utf-8', errors='replace')
-                if not data:
-                    continue  # EOF
-                buffers[fd] += data
+        # Execute FFmpeg and capture its output so that any error bubbles up.
+        ffmpeg.run(out_stream);
 
-                # Process complete lines
-                while '\n' in buffers[fd]:
-                    line, buffers[fd] = buffers[fd].split('\n', 1)
-                    line = line.strip()
-
-                    # stdout contains key=value pairs when -progress pipe is used
-                    if fd == process.stdout.fileno() and line.startswith('out_time_ms'):
-                        try:
-                            # out_time_ms is the current time of the output in microseconds
-                            time_us = int(line.split('=')[1])
-                            current_sec = time_us / 1_000_000.0
-                            progress_pct = (current_sec / duration) * 100.0
-
-                            if progress_pct == last_progress:
-                                stall_counter += 1
-                                if stall_counter > 20:
-                                    print(f"\nWarning: ffmpeg progress seems stalled at {progress_pct:.1f}%")
-                            else:
-                                stall_counter = 0
-                            last_progress = progress_pct
-                            print(f"\rCompositing video: {progress_pct:.1f}%", end='', flush=True)
-                        except Exception:
-                            # Ignore parsing errors, just continue
-                            pass
-                    elif fd == process.stderr.fileno():
-                        # Print ffmpeg warnings/errors verbosely
-                        if line:
-                            print(f"\nFFmpeg (err): {line}")
-
-        # Flush remaining buffer content
-        for fd, buf in buffers.items():
-            if buf.strip():
-                channel = "out" if fd == process.stdout.fileno() else "err"
-                print(f"\nFFmpeg ({channel}): {buf.strip()}")
-
-        ret_code = process.wait()
-        if ret_code != 0:
-            raise RuntimeError(f"FFmpeg exited with status {ret_code}")
-
-        print(f"\nComposited video saved to: {output_path}")
-
-    except Exception as exc:
-        raise Exception(f"Unexpected error during video composition: {exc}") from exc
+    except ffmpeg.Error as e:
+        # Decode the error for easier debugging before propagating upwards.
+        err_msg = e.stderr.decode() if hasattr(e, "stderr") else str(e)
+        raise RuntimeError(f"Error compositing video with overlay: {err_msg}") from e
 
 def main():
     # Set up argument parser
@@ -616,7 +602,7 @@ def main():
         
         # Composite the video with overlay
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
-        composite_video_with_map(
+        composite_video_with_overlay(
             metadata=metadata,
             video_path=args.video_file,
             overlay_video_path=overlay_video_path,
