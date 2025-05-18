@@ -17,6 +17,7 @@ class VideoMetadata:
     width: int
     height: int
     fps: float
+    fps_string: str
     duration: float
     bitrate: int
     frame_count: int  # Exact number of frames in the video
@@ -116,6 +117,7 @@ def extract_video_metadata(video_path):
             width=int(video_stream['width']),
             height=int(video_stream['height']),
             fps=eval(video_stream['r_frame_rate']),  # Convert fraction string to float
+            fps_string=video_stream['r_frame_rate'],
             duration=float(probe['format']['duration']),
             bitrate=int(probe['format']['bit_rate']),
             frame_count=frame_count
@@ -198,9 +200,9 @@ def generate_frames(
 
         closest_point = track_points[closest_idx]
         
-        # Create a new image with the video's resolution
-        frame = Image.new('RGBA', (video_metadata.width, video_metadata.height), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(frame)
+        # Create a new image for the map
+        map_image = Image.new('RGBA', map_size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(map_image)
         
         # Draw the complete track
         track_points_pixels = [lat_lon_to_pixel(p.latitude, p.longitude) for p in track_points]
@@ -214,7 +216,7 @@ def generate_frames(
             outline='white',
             width=2
         )
-            
+        
         # Add GPS information
         info_text = [
             f"Lat: {closest_point.latitude:.6f}°",
@@ -234,7 +236,7 @@ def generate_frames(
             draw.text((12, y_pos), text, font=font, fill='white')
         
         # Save the frame
-        frame.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
+        map_image.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
     
     # Print newline after completion
     print()  # Add newline after progress is complete
@@ -285,6 +287,7 @@ def main():
     
     try:
         metadata = extract_video_metadata(args.video_file)
+        print(metadata)
         track_points = parse_gpx_file(args.gps_file)
         
         # Generate frames
