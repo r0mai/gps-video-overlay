@@ -12,6 +12,7 @@ from typing import List
 import bisect
 import os
 from multiprocessing import Pool, cpu_count
+from functools import partial
 
 @dataclass
 class VideoMetadata:
@@ -143,15 +144,13 @@ def extract_video_metadata(video_path):
     except Exception as e:
         raise Exception(f"Unexpected error: {str(e)}")
 
-def generate_single_frame(params: FrameParams) -> tuple[int, Image.Image]:
+def generate_and_save_frame(params: FrameParams, output_dir: str) -> None:
     """
-    Generate a single frame with GPS visualization.
+    Generate a single frame with GPS visualization and save it to disk.
     
     Args:
         params: FrameParams object containing all necessary parameters
-        
-    Returns:
-        Tuple of (frame_num, frame_image)
+        output_dir: Directory to save the frame
     """
     def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
         """Convert latitude/longitude to pixel coordinates."""
@@ -209,7 +208,8 @@ def generate_single_frame(params: FrameParams) -> tuple[int, Image.Image]:
         # Draw white text
         draw.text((12, y_pos), text, font=params.font, fill='white')
     
-    return params.frame_num, map_image
+    # Save the frame
+    map_image.save(os.path.join(output_dir, f"frame_{params.frame_num:06d}.png"))
 
 def generate_map_frames(
     video_metadata: VideoMetadata,
@@ -270,15 +270,20 @@ def generate_map_frames(
         )
         frame_params.append(params)
     
-    # Use multiprocessing to generate frames
+    # Use multiprocessing to generate and save frames
     num_processes = max(1, cpu_count() - 1)  # Leave one CPU free
     print(f"Generating frames using {num_processes} processes...")
     
     with Pool(num_processes) as pool:
-        for frame_num, frame_image in pool.imap_unordered(generate_single_frame, frame_params):
-            frame_image.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
-            progress = (frame_num + 1) / total_frames * 100
-            print(f"\rProgress: {progress:.1f}%", end='', flush=True)
+        # Create a partial function with the output directory
+        generate_and_save_with_dir = partial(generate_and_save_frame, output_dir=output_dir)
+        
+        # Process frames in parallel
+        completed_frames = 0
+        for _ in pool.imap_unordered(generate_and_save_with_dir, frame_params):
+            completed_frames += 1
+            progress = completed_frames / total_frames * 100
+            print(f"\rProgress: {completed_frames}/{total_frames} ({progress:.1f}%)", end='', flush=True)
     
     print()  # Add newline after progress is complete
 
@@ -357,6 +362,7 @@ def main():
     parser.add_argument('--video-file', required=True, help='Path to the MP4 video file')
     parser.add_argument('--gps-file', required=True, help='Path to the GPX file')
     parser.add_argument('--output-dir', required=True, help='Directory to save generated frames')
+    parser.add_argument('--skip-generation', action='store_true', default=False, help='Skip generation of frames')
     
     # Parse arguments
     args = parser.parse_args()
@@ -367,13 +373,15 @@ def main():
         
         map_output_dir = os.path.join(args.output_dir, "map")
         map_size = (800, 600)
+
         # Generate frames
-        generate_map_frames(
-            video_metadata=metadata,
-            track_points=track_points,
-            output_dir=map_output_dir,
-            map_size=map_size
-        )
+        if not args.skip_generation:
+            generate_map_frames(
+                video_metadata=metadata,
+                track_points=track_points,
+                output_dir=map_output_dir,
+                map_size=map_size
+            )
         
         # Composite the video with map frames
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
