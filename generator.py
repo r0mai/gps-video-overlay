@@ -10,6 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 import os
 from typing import List
 import bisect
+import os
 
 @dataclass
 class VideoMetadata:
@@ -128,7 +129,7 @@ def extract_video_metadata(video_path):
     except Exception as e:
         raise Exception(f"Unexpected error: {str(e)}")
 
-def generate_frames(
+def generate_map_frames(
     video_metadata: VideoMetadata,
     track_points: List[GPSTrackPoint],
     output_dir: str,
@@ -275,6 +276,41 @@ def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
     speed = distance / time_diff
     return speed
 
+def composite_video_with_map(video_path: str, map_frames_dir: str, output_path: str) -> None:
+    """
+    Composite the original video with the map frames using ffmpeg.
+    
+    Args:
+        video_path: Path to the original video file
+        map_frames_dir: Directory containing the map frames
+        output_path: Path where the final video will be saved
+    """
+    try:
+        # Get the frame pattern for the map frames
+        frame_pattern = os.path.join(map_frames_dir, "frame_%06d.png")
+        
+        # Construct ffmpeg command to overlay map frames on video
+        stream = (
+            ffmpeg
+            .input(video_path)
+            .overlay(
+                ffmpeg.input(frame_pattern),
+                x=10,  # 10px margin from left
+                y=10   # 10px margin from top
+            )
+            .output(output_path)
+            .overwrite_output()
+        )
+        
+        # Run the ffmpeg command
+        stream.run(capture_stdout=True, capture_stderr=True)
+        print(f"\nComposited video saved to: {output_path}")
+        
+    except ffmpeg.Error as e:
+        raise Exception(f"Error compositing video: {str(e.stderr.decode())}")
+    except Exception as e:
+        raise Exception(f"Unexpected error during video composition: {str(e)}")
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract metadata from an MP4 video file and GPS data')
@@ -287,17 +323,25 @@ def main():
     
     try:
         metadata = extract_video_metadata(args.video_file)
-        print(metadata)
         track_points = parse_gpx_file(args.gps_file)
         
+        map_output_dir = os.path.join(args.output_dir, "map")
+        map_size = (800, 600)
         # Generate frames
-        generate_frames(
+        generate_map_frames(
             video_metadata=metadata,
             track_points=track_points,
-            output_dir=args.output_dir
+            output_dir=map_output_dir,
+            map_size=map_size
         )
         
-        print(f"Generated frames saved to {args.output_dir}")
+        # Composite the video with map frames
+        output_video = os.path.join(args.output_dir, "output_with_map.mp4")
+        composite_video_with_map(
+            video_path=args.video_file,
+            map_frames_dir=map_output_dir,
+            output_path=output_video
+        )
             
     except Exception as e:
         print(f"Error: {str(e)}")
