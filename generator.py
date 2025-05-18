@@ -476,29 +476,43 @@ def composite_video_with_map(metadata: VideoMetadata, video_path: str, overlay_v
         if not os.path.exists(overlay_video_path):
             raise FileNotFoundError(f"Overlay video file not found: {overlay_video_path}")
 
-        # Build FFmpeg filter graph
-        video_in = ffmpeg.input(video_path)
-        overlay_in = ffmpeg.input(overlay_video_path)
+        # Separate variables for the original inputs
+        video_input = ffmpeg.input(video_path)
+        overlay_input = ffmpeg.input(overlay_video_path)
 
-        # Positive offset (delay): duplicate the first frame so that it "fills" the gap
+        # Extract video streams and reset timestamps so both start at 0
+        base_video = video_input.video.filter('setpts', 'PTS-STARTPTS')
+        overlay_video = overlay_input.video.filter('setpts', 'PTS-STARTPTS')
+
+        # Apply positive / negative offset on the overlay if requested
         if offset_seconds > 0:
-            overlay_in = overlay_in.filter('tpad', start_duration=offset_seconds, start_mode='clone')
-        # Negative offset (advance): shift PTS earlier so the overlay starts sooner
+            # Delay overlay by duplicating its first frame
+            overlay_video = overlay_video.filter('tpad', start_duration=offset_seconds, start_mode='clone')
         elif offset_seconds < 0:
-            overlay_in = overlay_in.filter('setpts', f"PTS+{offset_seconds}/TB")
+            # Advance overlay by shifting timestamps (note: offset_seconds is negative)
+            overlay_video = overlay_video.filter('setpts', f"PTS+{offset_seconds}/TB")
 
-        # Now overlay the two streams
-        composed = ffmpeg.overlay(video_in, overlay_in, x=10, y=10)
+        # Compose the two video streams. `shortest=1` ensures encoding stops when the shorter stream ends.
+        composed = ffmpeg.overlay(base_video, overlay_video, x=10, y=10, shortest=1)
 
-        # Final output command
+        # Get audio stream (if any) from the original video
+        audio_stream = video_input.audio
+
+        # Build final output. Keep audio unchanged (copy) while encoding video layer.
         stream = (
             ffmpeg
             .output(
                 composed,
+                audio_stream,
                 output_path,
                 t=duration,
-                progress='pipe:1',  # Print progress to stdout
-                loglevel='warning'   # Show warnings and errors only
+                vcodec='libx264',
+                crf=18,
+                preset='medium',
+                acodec='copy',
+                movflags='+faststart',
+                progress='pipe:1',
+                loglevel='warning'
             )
             .overwrite_output()
         )
