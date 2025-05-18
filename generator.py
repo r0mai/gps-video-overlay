@@ -173,7 +173,12 @@ def generate_frames(
         font = ImageFont.load_default()
     
     # Generate frames using exact frame count
-    for frame_num in range(video_metadata.frame_count):
+    total_frames = video_metadata.frame_count
+    for frame_num in range(total_frames):
+        # Print progress indicator
+        progress = (frame_num + 1) / total_frames * 100
+        print(f"\rGenerating frame {frame_num + 1}/{total_frames} ({progress:.1f}%)", end='', flush=True)
+        
         # Calculate timestamp for this frame
         frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
         
@@ -217,6 +222,9 @@ def generate_frames(
         
         # Save the frame
         frame.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
+    
+    # Print newline after completion
+    print()  # Add newline after progress is complete
 
 def calculate_speed(current_point: GPSTrackPoint, all_points: List[GPSTrackPoint]) -> float:
     """Calculate speed in km/h based on the current point and previous points."""
