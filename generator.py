@@ -9,6 +9,7 @@ import gpxpy.gpx
 from PIL import Image, ImageDraw, ImageFont
 import os
 from typing import List
+import bisect
 
 @dataclass
 class VideoMetadata:
@@ -182,8 +183,20 @@ def generate_frames(
         # Calculate timestamp for this frame
         frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
         
-        # Find the closest GPS point to this timestamp
-        closest_point = min(track_points, key=lambda p: abs((p.timestamp - frame_time).total_seconds()))
+        # Find the closest GPS point to this timestamp using bisect
+        timestamps = [p.timestamp for p in track_points]
+        closest_idx = bisect.bisect_left(timestamps, frame_time)
+        
+        # Handle edge cases
+        if closest_idx == len(track_points):
+            closest_idx = len(track_points) - 1
+        else:
+            # Compare with previous point to find closest
+            if abs((track_points[closest_idx].timestamp - frame_time).total_seconds()) >= \
+               abs((track_points[closest_idx-1].timestamp - frame_time).total_seconds()):
+                closest_idx = closest_idx - 1
+
+        closest_point = track_points[closest_idx]
         
         # Create a new image with the video's resolution
         frame = Image.new('RGBA', (video_metadata.width, video_metadata.height), (0, 0, 0, 0))
@@ -207,7 +220,7 @@ def generate_frames(
             f"Lat: {closest_point.latitude:.6f}°",
             f"Lon: {closest_point.longitude:.6f}°",
             f"Elev: {closest_point.elevation:.1f}m",
-            f"Speed: {calculate_speed(closest_point, track_points):.1f} km/h",
+            f"Speed: {calculate_speed(closest_idx, track_points):.1f} km/h",
             f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
         ]
         
@@ -226,17 +239,17 @@ def generate_frames(
     # Print newline after completion
     print()  # Add newline after progress is complete
 
-def calculate_speed(current_point: GPSTrackPoint, all_points: List[GPSTrackPoint]) -> float:
+def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
     """Calculate speed in km/h based on the current point and previous points."""
     # Find the previous point
-    current_index = all_points.index(current_point)
-    if current_index == 0:
+    if closes_idx == 0:
         return 0.0
         
-    prev_point = all_points[current_index - 1]
+    closest_point = all_points[closes_idx]
+    prev_point = all_points[closes_idx - 1]
     
     # Calculate time difference in hours
-    time_diff = (current_point.timestamp - prev_point.timestamp).total_seconds() / 3600
+    time_diff = (closest_point.timestamp - prev_point.timestamp).total_seconds() / 3600
     
     if time_diff == 0:
         return 0.0
@@ -247,7 +260,7 @@ def calculate_speed(current_point: GPSTrackPoint, all_points: List[GPSTrackPoint
     R = 6371  # Earth's radius in kilometers
     
     lat1, lon1 = radians(prev_point.latitude), radians(prev_point.longitude)
-    lat2, lon2 = radians(current_point.latitude), radians(current_point.longitude)
+    lat2, lon2 = radians(closest_point.latitude), radians(closest_point.longitude)
     
     dlat = lat2 - lat1
     dlon = lon2 - lon1
