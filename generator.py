@@ -3,9 +3,12 @@
 import ffmpeg
 import argparse
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 import gpxpy
 import gpxpy.gpx
+from PIL import Image, ImageDraw, ImageFont
+import os
+from typing import List
 
 @dataclass
 class VideoMetadata:
@@ -114,26 +117,155 @@ def extract_video_metadata(video_path):
     except Exception as e:
         raise Exception(f"Unexpected error: {str(e)}")
 
+def generate_frames(
+    video_metadata: VideoMetadata,
+    track_points: List[GPSTrackPoint],
+    output_dir: str,
+    map_size: tuple = (800, 600)
+) -> None:
+    """
+    Generate PNG frames with GPS path visualization.
+    
+    Args:
+        video_metadata: Video metadata containing resolution and fps
+        track_points: List of GPS track points
+        output_dir: Directory to save generated frames
+        map_size: Size of the visualization in pixels (default: 800x600)
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Calculate frame duration
+    frame_duration = 1.0 / video_metadata.fps
+    
+    # Calculate bounds of the track
+    min_lat = min(p.latitude for p in track_points)
+    max_lat = max(p.latitude for p in track_points)
+    min_lon = min(p.longitude for p in track_points)
+    max_lon = max(p.longitude for p in track_points)
+    
+    # Add some padding to the bounds
+    lat_padding = (max_lat - min_lat) * 0.1
+    lon_padding = (max_lon - min_lon) * 0.1
+    min_lat -= lat_padding
+    max_lat += lat_padding
+    min_lon -= lon_padding
+    max_lon += lon_padding
+    
+    def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
+        """Convert latitude/longitude to pixel coordinates."""
+        x = int((lon - min_lon) / (max_lon - min_lon) * map_size[0])
+        y = int((1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1])
+        return (x, y)
+    
+    # Generate frames
+    for frame_num in range(int(video_metadata.duration * video_metadata.fps)):
+        # Calculate timestamp for this frame
+        frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+        
+        # Find the closest GPS point to this timestamp
+        closest_point = min(track_points, key=lambda p: abs((p.timestamp - frame_time).total_seconds()))
+        
+        # Create a new image with the video's resolution
+        frame = Image.new('RGBA', (video_metadata.width, video_metadata.height), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+        
+        # Draw the complete track
+        track_points_pixels = [lat_lon_to_pixel(p.latitude, p.longitude) for p in track_points]
+        draw.line(track_points_pixels, fill='blue', width=2)
+        
+        # Draw the current position
+        current_pos = lat_lon_to_pixel(closest_point.latitude, closest_point.longitude)
+        draw.ellipse(
+            (current_pos[0]-8, current_pos[1]-8, current_pos[0]+8, current_pos[1]+8),
+            fill='red',
+            outline='white',
+            width=2
+        )
+        
+        # Add GPS data overlay
+        try:
+            font = ImageFont.truetype("DejaVuSans.ttf", 24)
+        except:
+            font = ImageFont.load_default()
+            
+        # Add GPS information
+        info_text = [
+            f"Lat: {closest_point.latitude:.6f}°",
+            f"Lon: {closest_point.longitude:.6f}°",
+            f"Elev: {closest_point.elevation:.1f}m",
+            f"Speed: {calculate_speed(closest_point, track_points):.1f} km/h",
+            f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
+        ]
+        
+        # Draw text with black outline for better visibility
+        for i, text in enumerate(info_text):
+            y_pos = 10 + i * 30
+            # Draw black outline
+            for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
+                draw.text((12 + offset_x, y_pos + offset_y), text, font=font, fill='black')
+            # Draw white text
+            draw.text((12, y_pos), text, font=font, fill='white')
+        
+        # Save the frame
+        frame.save(os.path.join(output_dir, f"frame_{frame_num:06d}.png"))
+
+def calculate_speed(current_point: GPSTrackPoint, all_points: List[GPSTrackPoint]) -> float:
+    """Calculate speed in km/h based on the current point and previous points."""
+    # Find the previous point
+    current_index = all_points.index(current_point)
+    if current_index == 0:
+        return 0.0
+        
+    prev_point = all_points[current_index - 1]
+    
+    # Calculate time difference in hours
+    time_diff = (current_point.timestamp - prev_point.timestamp).total_seconds() / 3600
+    
+    if time_diff == 0:
+        return 0.0
+        
+    # Calculate distance using haversine formula
+    from math import radians, sin, cos, sqrt, atan2
+    
+    R = 6371  # Earth's radius in kilometers
+    
+    lat1, lon1 = radians(prev_point.latitude), radians(prev_point.longitude)
+    lat2, lon2 = radians(current_point.latitude), radians(current_point.longitude)
+    
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    
+    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
+    c = 2 * atan2(sqrt(a), sqrt(1-a))
+    distance = R * c
+    
+    # Calculate speed in km/h
+    speed = distance / time_diff
+    return speed
+
 def main():
     # Set up argument parser
     parser = argparse.ArgumentParser(description='Extract metadata from an MP4 video file and GPS data')
     parser.add_argument('--video-file', required=True, help='Path to the MP4 video file')
     parser.add_argument('--gps-file', required=True, help='Path to the GPX file')
+    parser.add_argument('--output-dir', required=True, help='Directory to save generated frames')
     
     # Parse arguments
     args = parser.parse_args()
     
     try:
         metadata = extract_video_metadata(args.video_file)
-        print("Video Metadata:")
-        print(f"Resolution: {metadata.width}x{metadata.height}")
-        print(f"Frame Rate: {metadata.fps} fps")
-        print(f"Duration: {metadata.duration:.2f} seconds")
-        print(f"Bitrate: {metadata.bitrate / 1000:.2f} kbps")
-        
         track_points = parse_gpx_file(args.gps_file)
-        for i in range(5):
-            print(track_points[i])
+        
+        # Generate frames
+        generate_frames(
+            video_metadata=metadata,
+            track_points=track_points,
+            output_dir=args.output_dir
+        )
+        
+        print(f"Generated frames saved to {args.output_dir}")
             
     except Exception as e:
         print(f"Error: {str(e)}")
