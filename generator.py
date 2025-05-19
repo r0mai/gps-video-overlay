@@ -290,39 +290,63 @@ def generate_map_frames(
     
     print()  # Add newline after progress is complete
 
-def calculate_speed(closes_idx: int, all_points: List[GPSTrackPoint]) -> float:
-    """Calculate speed in km/h based on the current point and previous points."""
-    # Find the previous point
-    if closes_idx == 0:
+def calculate_speed(
+    closes_idx: int,
+    all_points: List[GPSTrackPoint],
+    window_seconds: float = 5.0,
+) -> float:
+    """Return average speed (km/h) over a *window_seconds* look-back period.
+
+    The function walks backwards from *closes_idx* until the accumulated
+    timespan reaches or exceeds *window_seconds*, then computes the total
+    travelled distance across those segments divided by the actual elapsed
+    time.
+
+    Parameters
+    ----------
+    closes_idx : int
+        Index of the track-point considered the *current* position.
+    all_points : list[GPSTrackPoint]
+        The full ordered list of track points.
+    window_seconds : float, default 5.0
+        Duration (in seconds) over which to average the speed.
+    """
+
+    if closes_idx == 0 or window_seconds <= 0:
         return 0.0
-        
-    closest_point = all_points[closes_idx]
-    prev_point = all_points[closes_idx - 1]
-    
-    # Calculate time difference in hours
-    time_diff = (closest_point.timestamp - prev_point.timestamp).total_seconds() / 3600
-    
-    if time_diff == 0:
+
+    # Identify the earliest point that is still within the window.
+    current_point = all_points[closes_idx]
+    start_idx = closes_idx
+
+    while (
+        start_idx > 0 and
+        (current_point.timestamp - all_points[start_idx - 1].timestamp).total_seconds() <= window_seconds
+    ):
+        start_idx -= 1
+
+    # If no movement (timestamps equal), bail out.
+    time_diff_sec = (current_point.timestamp - all_points[start_idx].timestamp).total_seconds()
+    if time_diff_sec == 0:
         return 0.0
-        
-    # Calculate distance using haversine formula
+
+    # Sum segment distances between consecutive points from start_idx to closes_idx.
     from math import radians, sin, cos, sqrt, atan2
-    
-    R = 6371  # Earth's radius in kilometers
-    
-    lat1, lon1 = radians(prev_point.latitude), radians(prev_point.longitude)
-    lat2, lon2 = radians(closest_point.latitude), radians(closest_point.longitude)
-    
-    dlat = lat2 - lat1
-    dlon = lon2 - lon1
-    
-    a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1-a))
-    distance = R * c
-    
-    # Calculate speed in km/h
-    speed = distance / time_diff
-    return speed
+
+    def haversine(lat1, lon1, lat2, lon2):
+        R = 6371  # km
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+        return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+
+    distance_km = 0.0
+    for i in range(start_idx, closes_idx):
+        p1, p2 = all_points[i], all_points[i + 1]
+        distance_km += haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
+
+    speed_kmh = distance_km / (time_diff_sec / 3600.0)
+    return speed_kmh
 
 # ---------------------------------------------------------------------------
 # Video overlay generation (transparent MOV)                                |
@@ -334,6 +358,7 @@ def generate_map_video(
     output_path: str,
     map_size: tuple = (800, 600),
     overlay_fps: float = 5.0,
+    speed_window: float = 5.0,
 ) -> None:
     """
     Generate a transparent video with GPS path visualization.
@@ -344,6 +369,7 @@ def generate_map_video(
         output_path: Path to save the generated video
         map_size: Size of the visualization in pixels (default: 800x600)
         overlay_fps: Frame rate (frames per second) for the generated overlay video
+        speed_window: Window duration in seconds for calculating speed
     """
     # Calculate frame duration based on *overlay* fps (not the base video fps)
     if overlay_fps <= 0:
@@ -444,7 +470,7 @@ def generate_map_video(
                 f"Lat: {closest_point.latitude:.6f}°",
                 f"Lon: {closest_point.longitude:.6f}°",
                 f"Elev: {closest_point.elevation:.1f}m",
-                f"Speed: {calculate_speed(closest_idx, track_points):.1f} km/h",
+                f"Speed: {calculate_speed(closest_idx, track_points, window_seconds=speed_window):.1f} km/h",
                 f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
             ]
             
@@ -621,6 +647,8 @@ def main():
     parser.add_argument('--skip-generation', action='store_true', default=False, help='Skip generation of overlay video')
     parser.add_argument('--max-duration', type=float, help='Maximum duration of the output video in seconds')
     parser.add_argument('--offset-seconds', type=float, default=0, help='Offset in seconds for the overlay layer (positive = delay, negative = advance)')
+    parser.add_argument('--speed-window', type=float, default=5.0, help='Time window (in seconds) over which to average the displayed speed')
+    parser.add_argument('--overlay-fps', type=float, default=5.0, help='Frame rate (frames per second) for the generated overlay video')
     # Parse arguments
     args = parser.parse_args()
     
@@ -638,7 +666,8 @@ def main():
                 track_points=track_points,
                 output_path=overlay_video_path,
                 map_size=map_size,
-                overlay_fps=1.0,
+                overlay_fps=args.overlay_fps,
+                speed_window=args.speed_window,
             )
         
         # Composite the video with overlay
