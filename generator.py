@@ -25,6 +25,14 @@ class VideoMetadata:
     bitrate: int
     frame_count: int  # Exact number of frames in the video
 
+@dataclass
+class OverlaySettings:
+    video_path: str
+    x: int
+    y: int
+    width: int
+    height: int
+
 def parse_gpx_file(gpx_path: str) -> list[GPSTrackPoint]:
     """
     Parse a GPX file and extract track points.
@@ -128,12 +136,18 @@ def extract_video_metadata(video_path):
 # Video overlay generation (transparent MOV)                                |
 # ---------------------------------------------------------------------------
 
-def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overlay_video_path: str, output_path: str, max_duration: float = None, offset_seconds: float = 0.0) -> None:
+def composite_video_with_overlays(
+    metadata: VideoMetadata,
+    video_path: str,
+    overlay_settings: List[OverlaySettings],
+    output_path: str,
+    max_duration: float = None,
+    offset_seconds: float = 0.0) -> None:
     """
-    Composite the original video with the overlay video using FFmpeg.
+    Composite the original video with multiple overlay videos using FFmpeg.
 
-    The function will place the (usually smaller) overlay video on top of the
-    bottom-left corner of the original clip while preserving its alpha channel.
+    The function will place overlay videos on top of the original clip at their
+    specified positions while preserving their alpha channels.
 
     Parameters
     ----------
@@ -143,62 +157,63 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
         helper functions.
     video_path : str
         Path to the original/base video.
-    overlay_video_path : str
-        Path to the previously generated transparent overlay video.
+    overlay_settings : List[OverlaySettings]
+        List of overlay settings, each containing video path and positioning info.
     output_path : str
         Path where the composited file will be written.
     max_duration : float | None, optional
         If provided the output will be trimmed/clamped to this duration (in
         seconds).
     offset_seconds : float, default 0.0
-        Positive values delay the overlay relative to the base video, negative
-        values advance it.  Implemented via a `setpts` filter on the overlay
-        stream.
+        Positive values delay the overlays relative to the base video, negative
+        values advance them.  Implemented via a `setpts` filter on the overlay
+        streams.
     """
 
     # Build FFmpeg input streams
     try:
         # Base/original clip (keep audio if present).
         base_in = ffmpeg.input(video_path)
+        
+        # Start with the base video
+        current_video = base_in.video
+        
+        # Process each overlay
+        for i, overlay_setting in enumerate(overlay_settings):
+            # Load overlay video
+            overlay_in = ffmpeg.input(overlay_setting.video_path)
+            overlay_video = overlay_in.video  # isolate the video stream
 
-        # Overlay clip – video only (usually has no audio).  If the caller
-        # wants the overlay to start later/earlier we adjust its PTS.
-        overlay_in = ffmpeg.input(overlay_video_path)
+            # If an offset is requested we either:
+            #  • Positive offset  -> freeze the first frame for `offset_seconds`
+            #  • Negative offset  -> start the overlay earlier by shifting PTS
+            # In both cases we keep the last frame visible afterwards by using
+            # `eof_action=repeat` later in the overlay filter.
+            if offset_seconds > 0:
+                # Clone the first frame so that it is displayed until the overlay
+                # actually starts moving.
+                overlay_video = overlay_video.filter(
+                    "tpad",
+                    start_duration=offset_seconds,
+                    start_mode="clone",
+                )
+            elif offset_seconds < 0:
+                # Advance the overlay timeline; frames that would fall before
+                # t=0 are discarded automatically by FFmpeg.
+                overlay_video = overlay_video.filter(
+                    "setpts",
+                    f"PTS+{offset_seconds}/TB",  # note: offset_seconds is negative here
+                )
 
-        overlay_video = overlay_in.video  # isolate the video stream
-
-        # If an offset is requested we either:
-        #  • Positive offset  -> freeze the first frame for `offset_seconds`
-        #  • Negative offset  -> start the overlay earlier by shifting PTS
-        # In both cases we keep the last frame visible afterwards by using
-        # `eof_action=repeat` later in the overlay filter.
-        if offset_seconds > 0:
-            # Clone the first frame so that it is displayed until the overlay
-            # actually starts moving.
-            overlay_video = overlay_video.filter(
-                "tpad",
-                start_duration=offset_seconds,
-                start_mode="clone",
+            # Apply overlay at the specified position
+            current_video = ffmpeg.overlay(
+                current_video,
+                overlay_video,
+                x=overlay_setting.x,
+                y=overlay_setting.y,
+                format="auto",  # let FFmpeg choose the correct format (keeps alpha)
+                eof_action="repeat",  # when overlay ends, repeat the last frame
             )
-        elif offset_seconds < 0:
-            # Advance the overlay timeline; frames that would fall before
-            # t=0 are discarded automatically by FFmpeg.
-            overlay_video = overlay_video.filter(
-                "setpts",
-                f"PTS+{offset_seconds}/TB",  # note: offset_seconds is negative here
-            )
-
-        # Position the overlay 10px from the left and 10px from the bottom.
-        # `main_h-overlay_h-10` keeps the overlay anchored to the bottom.
-        composited = ffmpeg.overlay(
-            base_in.video,
-            overlay_video,
-            x=10,
-            y=10,
-            # y="main_h-overlay_h-10",
-            format="auto",  # let FFmpeg choose the correct format (keeps alpha)
-            eof_action="repeat",  # when overlay ends, repeat the last frame
-        )
 
         # Detect whether the base video contains an audio stream – if not we
         # must *not* try to map it in the output, otherwise FFmpeg will error
@@ -232,7 +247,7 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
             out_stream = (
                 ffmpeg
                 .output(
-                    composited,
+                    current_video,
                     base_in.audio,
                     output_path,
                     **output_kwargs,
@@ -247,7 +262,7 @@ def composite_video_with_overlay(metadata: VideoMetadata, video_path: str, overl
             out_stream = (
                 ffmpeg
                 .output(
-                    composited,
+                    current_video,
                     output_path,
                     **output_kwargs_no_audio,
                 )
@@ -284,13 +299,21 @@ def main():
         track_points = parse_gpx_file(args.gps_file)
         
         map_size = (800, 600)
-        overlay_video_path = os.path.join(args.output_dir, "overlay.mov")
+        map_overlay_video_path = os.path.join(args.output_dir, "overlay.mov")
+
+        map_overlay_settings = OverlaySettings(
+            video_path=map_overlay_video_path,
+            x=10,
+            y=10,
+            width=map_size[0],
+            height=map_size[1],
+        )
 
         # Generate overlay video
         if not args.skip_generation:
             generate_map_video(
                 track_points=track_points,
-                output_path=overlay_video_path,
+                output_path=map_overlay_video_path,
                 map_size=map_size,
                 overlay_fps=args.overlay_fps,
                 speed_window=args.speed_window,
@@ -299,10 +322,10 @@ def main():
         
         # Composite the video with overlay
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
-        composite_video_with_overlay(
+        composite_video_with_overlays(
             metadata=metadata,
             video_path=args.video_file,
-            overlay_video_path=overlay_video_path,
+            overlay_settings=[map_overlay_settings],
             output_path=output_video,
             max_duration=args.max_duration,
             offset_seconds=args.offset_seconds
