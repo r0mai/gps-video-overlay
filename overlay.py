@@ -153,6 +153,52 @@ def calculate_speed_interpolated(
     speed_kmh = distance_km / (time_diff_sec / 3600.0)
     return speed_kmh
 
+def generate_video_frames(
+    output_path: str,
+    size: tuple,
+    overlay_fps: float,
+    frame_generator: callable,
+) -> None:
+    """
+    Generate a video using FFmpeg with frames provided by a generator function.
+    
+    Args:
+        output_path: Path where the video will be saved
+        size: Tuple of (width, height) for the video
+        overlay_fps: Frame rate for the video
+        frame_generator: Function that generates a single frame. Should accept frame_num and return a numpy array of shape (height, width, 4) in RGBA format
+        progress_message: Message to display during progress reporting
+    """
+    # Start FFmpeg process
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
+               s=f'{size[0]}x{size[1]}', r=overlay_fps)
+        .output(output_path, vcodec='prores_ks', profile='4444', 
+                pix_fmt='yuva444p10le', r=overlay_fps)
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    
+    try:
+        frame_num = 0
+        while True:
+            # Generate frame
+            frame = frame_generator(frame_num)
+            if frame is None:
+                break
+                
+            # Write frame
+            process.stdin.write(frame.tobytes())
+            frame_num += 1
+        print()
+        
+    except Exception as e:
+        raise Exception(f"Error generating video: {str(e)}")
+    finally:
+        process.stdin.close()
+        process.wait()
+
 def generate_map_video(
     track_points: List[GPSTrackPoint],
     output_path: str,
@@ -207,117 +253,99 @@ def generate_map_video(
     gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
     total_frames = int(gps_duration * overlay_fps + 0.5)
     
-    # Start FFmpeg process
-    process = (
-        ffmpeg
-        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
-               s=f'{map_size[0]}x{map_size[1]}', r=overlay_fps)
-        .output(output_path, vcodec='prores_ks', profile='4444', 
-                pix_fmt='yuva444p10le', r=overlay_fps)
-        .overwrite_output()
-        .run_async(pipe_stdin=True)
-    )
+    # Create a persistent map surface if we have map tiles
+    map_surface = None
+    if map_image is not None:
+        # Create the map surface once, outside the loop
+        map_surface = cairo.ImageSurface.create_for_data(
+            map_image, cairo.FORMAT_ARGB32, 
+            map_size[0], map_size[1],
+            map_size[0] * 4  # stride = width * 4 bytes per pixel
+        )
     
-    try:
-        # Create a persistent map surface if we have map tiles
-        map_surface = None
-        if map_image is not None:
-            # Create the map surface once, outside the loop
-            map_surface = cairo.ImageSurface.create_for_data(
-                map_image, cairo.FORMAT_ARGB32, 
-                map_size[0], map_size[1],
-                map_size[0] * 4  # stride = width * 4 bytes per pixel
-            )
+    def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
+        x = (lon - min_lon) / (max_lon - min_lon) * map_size[0]
+        y = (1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1]
+        return (x, y)
+    
+    def generate_frame(frame_num: int) -> np.ndarray:
+        if frame_num >= total_frames:
+            return None
+            
+        frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+        interpolated_point = get_interpolated_gps_point(track_points, frame_time)
         
-        for frame_num in range(total_frames):
-            frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
-            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+        # Create Cairo surface
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, map_size[0], map_size[1])
+        ctx = cairo.Context(surface)
+        
+        # Draw map background if available
+        if map_surface is not None:
+            ctx.set_source_surface(map_surface, 0, 0)
+            ctx.paint()
             
-            # Create Cairo surface
-            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, map_size[0], map_size[1])
-            ctx = cairo.Context(surface)
-            
-            # Draw map background if available
-            if map_surface is not None:
-                ctx.set_source_surface(map_surface, 0, 0)
-                ctx.paint()
-                
-                # Add semi-transparent overlay to make the track more visible
-                ctx.set_source_rgba(0, 0, 0, 0.2)
-                ctx.paint()
+            # Add semi-transparent overlay to make the track more visible
+            ctx.set_source_rgba(0, 0, 0, 0.2)
+            ctx.paint()
+        else:
+            # Clear with transparent background
+            ctx.set_source_rgba(0, 0, 0, 0)
+            ctx.paint()
+        
+        # Draw track with enhanced visibility
+        ctx.set_line_width(4)
+        
+        # Draw white outline first
+        ctx.set_source_rgba(1, 1, 1, 0.8)
+        for i, point in enumerate(track_points):
+            x, y = lat_lon_to_pixel(point.latitude, point.longitude)
+            if i == 0:
+                ctx.move_to(x, y)
             else:
-                # Clear with transparent background
-                ctx.set_source_rgba(0, 0, 0, 0)
-                ctx.paint()
-            
-            def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
-                x = (lon - min_lon) / (max_lon - min_lon) * map_size[0]
-                y = (1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1]
-                return (x, y)
-            
-            # Draw track with enhanced visibility
-            ctx.set_line_width(4)
-            
-            # Draw white outline first
-            ctx.set_source_rgba(1, 1, 1, 0.8)
-            for i, point in enumerate(track_points):
-                x, y = lat_lon_to_pixel(point.latitude, point.longitude)
-                if i == 0:
-                    ctx.move_to(x, y)
-                else:
-                    ctx.line_to(x, y)
-            ctx.stroke()
-            
-            # Draw colored track on top
-            ctx.set_line_width(3)
-            ctx.set_source_rgb(0.2, 0.4, 1.0)
-            for i, point in enumerate(track_points):
-                x, y = lat_lon_to_pixel(point.latitude, point.longitude)
-                if i == 0:
-                    ctx.move_to(x, y)
-                else:
-                    ctx.line_to(x, y)
-            ctx.stroke()
-            
-            # Draw current position with glow effect
-            current_pos = lat_lon_to_pixel(interpolated_point.latitude, interpolated_point.longitude)
-            
-            # Glow effect
-            for radius in [20, 15, 10]:
-                ctx.arc(current_pos[0], current_pos[1], radius, 0, 2 * 3.14159)
-                alpha = 0.1 if radius == 20 else 0.2 if radius == 15 else 0.4
-                ctx.set_source_rgba(1, 0, 0, alpha)
-                ctx.fill()
-            
-            # Main dot
-            ctx.arc(current_pos[0], current_pos[1], 6, 0, 2 * 3.14159)
-            ctx.set_source_rgba(1, 1, 1, 1)
+                ctx.line_to(x, y)
+        ctx.stroke()
+        
+        # Draw colored track on top
+        ctx.set_line_width(3)
+        ctx.set_source_rgb(0.2, 0.4, 1.0)
+        for i, point in enumerate(track_points):
+            x, y = lat_lon_to_pixel(point.latitude, point.longitude)
+            if i == 0:
+                ctx.move_to(x, y)
+            else:
+                ctx.line_to(x, y)
+        ctx.stroke()
+        
+        # Draw current position with glow effect
+        current_pos = lat_lon_to_pixel(interpolated_point.latitude, interpolated_point.longitude)
+        
+        # Glow effect
+        for radius in [20, 15, 10]:
+            ctx.arc(current_pos[0], current_pos[1], radius, 0, 2 * 3.14159)
+            alpha = 0.1 if radius == 20 else 0.2 if radius == 15 else 0.4
+            ctx.set_source_rgba(1, 0, 0, alpha)
             ctx.fill()
-            
-            # Add text with background for better readability
-            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(20)
-            
-            # Convert Cairo surface to bytes
-            buf = surface.get_data()
-            img_array = np.ndarray(shape=(map_size[1], map_size[0], 4), 
-                                 dtype=np.uint8, buffer=buf)
-            # Cairo uses BGRA, convert to RGBA
-            img_array = img_array[:, :, [2, 1, 0, 3]]
-            
-            # Write frame
-            process.stdin.write(img_array.tobytes())
-            
-            progress = (frame_num + 1) / total_frames * 100
-            print(f"\rGenerating overlay video: {progress:.1f}%", end='', flush=True)
         
-        print()
+        # Main dot
+        ctx.arc(current_pos[0], current_pos[1], 6, 0, 2 * 3.14159)
+        ctx.set_source_rgba(1, 1, 1, 1)
+        ctx.fill()
         
-    except Exception as e:
-        raise Exception(f"Error generating overlay video: {str(e)}")
-    finally:
-        process.stdin.close()
-        process.wait()
+        # Convert Cairo surface to bytes
+        buf = surface.get_data()
+        img_array = np.ndarray(shape=(map_size[1], map_size[0], 4), 
+                             dtype=np.uint8, buffer=buf)
+        # Cairo uses BGRA, convert to RGBA
+        img_array = img_array[:, :, [2, 1, 0, 3]]
+        
+        return img_array
+    
+    generate_video_frames(
+        output_path=output_path,
+        size=map_size,
+        overlay_fps=overlay_fps,
+        frame_generator=generate_frame,
+    )
 
 def generate_heightmap_video(
     track_points: List[GPSTrackPoint],
@@ -379,177 +407,162 @@ def generate_heightmap_video(
     chart_width = chart_size[0] - margin_left - margin_right
     chart_height = chart_size[1] - margin_top - margin_bottom
     
-    # Start FFmpeg process
-    process = (
-        ffmpeg
-        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
-               s=f'{chart_size[0]}x{chart_size[1]}', r=overlay_fps)
-        .output(output_path, vcodec='prores_ks', profile='4444', 
-                pix_fmt='yuva444p10le', r=overlay_fps)
-        .overwrite_output()
-        .run_async(pipe_stdin=True)
-    )
+    def distance_to_x(distance: float) -> float:
+        return margin_left + (distance / total_distance) * chart_width
     
-    try:
-        for frame_num in range(total_frames):
-            frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
-            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+    def elevation_to_y(elevation: float) -> float:
+        normalized = (elevation - min_elevation) / (max_elevation - min_elevation)
+        return margin_top + chart_height - (normalized * chart_height)
+    
+    def generate_frame(frame_num: int) -> np.ndarray:
+        if frame_num >= total_frames:
+            return None
             
-            # Create Cairo surface
-            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, chart_size[0], chart_size[1])
-            ctx = cairo.Context(surface)
-            
-            # Clear with semi-transparent background
-            ctx.set_source_rgba(0, 0, 0, 0.8)
-            ctx.paint()
-            
-            # Helper functions for coordinate conversion
-            def distance_to_x(distance: float) -> float:
-                return margin_left + (distance / total_distance) * chart_width
-            
-            def elevation_to_y(elevation: float) -> float:
-                normalized = (elevation - min_elevation) / (max_elevation - min_elevation)
-                return margin_top + chart_height - (normalized * chart_height)
-            
-            # Draw grid lines
-            ctx.set_line_width(1)
-            ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8)
-            
-            # Vertical grid lines (distance)
-            for i in range(6):  # 5 intervals
-                x = margin_left + (i / 5) * chart_width
-                ctx.move_to(x, margin_top)
-                ctx.line_to(x, margin_top + chart_height)
-                ctx.stroke()
-            
-            # Horizontal grid lines (elevation)
-            for i in range(6):  # 5 intervals
-                y = margin_top + (i / 5) * chart_height
-                ctx.move_to(margin_left, y)
-                ctx.line_to(margin_left + chart_width, y)
-                ctx.stroke()
-            
-            # Draw elevation profile
-            ctx.set_line_width(3)
-            ctx.set_source_rgba(0.2, 0.8, 0.2, 1.0)  # Green line
-            
-            for i, point in enumerate(track_points):
-                if point.elevation is None:
-                    continue
-                    
-                x = distance_to_x(cumulative_distances[i])
-                y = elevation_to_y(point.elevation)
-                
-                if i == 0:
-                    ctx.move_to(x, y)
-                else:
-                    ctx.line_to(x, y)
+        frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+        interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+        
+        # Create Cairo surface
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, chart_size[0], chart_size[1])
+        ctx = cairo.Context(surface)
+        
+        # Clear with semi-transparent background
+        ctx.set_source_rgba(0, 0, 0, 0.8)
+        ctx.paint()
+        
+        # Draw grid lines
+        ctx.set_line_width(1)
+        ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8)
+        
+        # Vertical grid lines (distance)
+        for i in range(6):  # 5 intervals
+            x = margin_left + (i / 5) * chart_width
+            ctx.move_to(x, margin_top)
+            ctx.line_to(x, margin_top + chart_height)
             ctx.stroke()
+        
+        # Horizontal grid lines (elevation)
+        for i in range(6):  # 5 intervals
+            y = margin_top + (i / 5) * chart_height
+            ctx.move_to(margin_left, y)
+            ctx.line_to(margin_left + chart_width, y)
+            ctx.stroke()
+        
+        # Draw elevation profile
+        ctx.set_line_width(3)
+        ctx.set_source_rgba(0.2, 0.8, 0.2, 1.0)  # Green line
+        
+        for i, point in enumerate(track_points):
+            if point.elevation is None:
+                continue
+                
+            x = distance_to_x(cumulative_distances[i])
+            y = elevation_to_y(point.elevation)
             
-            # Calculate current distance for the interpolated point
-            # Find the two points that bracket the current time
-            idx = bisect.bisect_left([p.timestamp for p in track_points], frame_time)
-            if idx == 0:
-                current_distance = 0.0
-            elif idx >= len(track_points):
-                current_distance = total_distance
+            if i == 0:
+                ctx.move_to(x, y)
             else:
-                # Interpolate distance
-                prev_point = track_points[idx-1]
-                next_point = track_points[idx]
-                time_ratio = (frame_time - prev_point.timestamp).total_seconds() / \
-                            (next_point.timestamp - prev_point.timestamp).total_seconds()
-                current_distance = cumulative_distances[idx-1] + \
-                                 (cumulative_distances[idx] - cumulative_distances[idx-1]) * time_ratio
-            
-            # Draw current position indicator
-            current_x = distance_to_x(current_distance)
-            current_y = elevation_to_y(interpolated_point.elevation)
-            
-            # Vertical line at current position
-            ctx.set_line_width(2)
-            ctx.set_source_rgba(1, 0, 0, 0.8)  # Red line
-            ctx.move_to(current_x, margin_top)
-            ctx.line_to(current_x, margin_top + chart_height)
-            ctx.stroke()
-            
-            # Current position dot
-            ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
-            ctx.set_source_rgba(1, 0, 0, 1)  # Red dot
-            ctx.fill()
-            
-            # White outline for dot
-            ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
-            ctx.set_source_rgba(1, 1, 1, 1)
-            ctx.set_line_width(2)
-            ctx.stroke()
-            
-            # Draw axes
-            ctx.set_line_width(2)
-            ctx.set_source_rgba(1, 1, 1, 1)
-            
-            # Y-axis
-            ctx.move_to(margin_left, margin_top)
-            ctx.line_to(margin_left, margin_top + chart_height)
-            ctx.stroke()
-            
-            # X-axis
-            ctx.move_to(margin_left, margin_top + chart_height)
-            ctx.line_to(margin_left + chart_width, margin_top + chart_height)
-            ctx.stroke()
-            
-            # Add labels
-            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
-            ctx.set_font_size(12)
-            ctx.set_source_rgba(1, 1, 1, 1)
-            
-            # Y-axis labels (elevation)
-            for i in range(6):
-                elevation = min_elevation + (i / 5) * (max_elevation - min_elevation)
-                y = margin_top + chart_height - (i / 5) * chart_height
-                label = f"{elevation:.0f}m"
-                
-                text_extents = ctx.text_extents(label)
-                ctx.move_to(margin_left - text_extents.width - 10, y + text_extents.height / 2)
-                ctx.show_text(label)
-            
-            # X-axis labels (distance)
-            for i in range(6):
-                distance = (i / 5) * total_distance
-                x = margin_left + (i / 5) * chart_width
-                label = f"{distance:.1f}km"
-                
-                text_extents = ctx.text_extents(label)
-                ctx.move_to(x - text_extents.width / 2, margin_top + chart_height + 20)
-                ctx.show_text(label)
-            
-            # Current info
-            ctx.set_font_size(14)
-            current_info = f"Current: {interpolated_point.elevation:.1f}m at {current_distance:.1f}km"
-            text_extents = ctx.text_extents(current_info)
-            ctx.move_to(chart_size[0] - text_extents.width - 10, chart_size[1] - 10)
-            ctx.show_text(current_info)
-            
-            # Convert Cairo surface to bytes
-            buf = surface.get_data()
-            img_array = np.ndarray(shape=(chart_size[1], chart_size[0], 4), 
-                                 dtype=np.uint8, buffer=buf)
-            # Cairo uses BGRA, convert to RGBA
-            img_array = img_array[:, :, [2, 1, 0, 3]]
-            
-            # Write frame
-            process.stdin.write(img_array.tobytes())
-            
-            progress = (frame_num + 1) / total_frames * 100
-            print(f"\rGenerating heightmap video: {progress:.1f}%", end='', flush=True)
+                ctx.line_to(x, y)
+        ctx.stroke()
         
-        print()
+        # Calculate current distance for the interpolated point
+        # Find the two points that bracket the current time
+        idx = bisect.bisect_left([p.timestamp for p in track_points], frame_time)
+        if idx == 0:
+            current_distance = 0.0
+        elif idx >= len(track_points):
+            current_distance = total_distance
+        else:
+            # Interpolate distance
+            prev_point = track_points[idx-1]
+            next_point = track_points[idx]
+            time_ratio = (frame_time - prev_point.timestamp).total_seconds() / \
+                        (next_point.timestamp - prev_point.timestamp).total_seconds()
+            current_distance = cumulative_distances[idx-1] + \
+                             (cumulative_distances[idx] - cumulative_distances[idx-1]) * time_ratio
         
-    except Exception as e:
-        raise Exception(f"Error generating heightmap video: {str(e)}")
-    finally:
-        process.stdin.close()
-        process.wait()
+        # Draw current position indicator
+        current_x = distance_to_x(current_distance)
+        current_y = elevation_to_y(interpolated_point.elevation)
+        
+        # Vertical line at current position
+        ctx.set_line_width(2)
+        ctx.set_source_rgba(1, 0, 0, 0.8)  # Red line
+        ctx.move_to(current_x, margin_top)
+        ctx.line_to(current_x, margin_top + chart_height)
+        ctx.stroke()
+        
+        # Current position dot
+        ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
+        ctx.set_source_rgba(1, 0, 0, 1)  # Red dot
+        ctx.fill()
+        
+        # White outline for dot
+        ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
+        ctx.set_source_rgba(1, 1, 1, 1)
+        ctx.set_line_width(2)
+        ctx.stroke()
+        
+        # Draw axes
+        ctx.set_line_width(2)
+        ctx.set_source_rgba(1, 1, 1, 1)
+        
+        # Y-axis
+        ctx.move_to(margin_left, margin_top)
+        ctx.line_to(margin_left, margin_top + chart_height)
+        ctx.stroke()
+        
+        # X-axis
+        ctx.move_to(margin_left, margin_top + chart_height)
+        ctx.line_to(margin_left + chart_width, margin_top + chart_height)
+        ctx.stroke()
+        
+        # Add labels
+        ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+        ctx.set_font_size(12)
+        ctx.set_source_rgba(1, 1, 1, 1)
+        
+        # Y-axis labels (elevation)
+        for i in range(6):
+            elevation = min_elevation + (i / 5) * (max_elevation - min_elevation)
+            y = margin_top + chart_height - (i / 5) * chart_height
+            label = f"{elevation:.0f}m"
+            
+            text_extents = ctx.text_extents(label)
+            ctx.move_to(margin_left - text_extents.width - 10, y + text_extents.height / 2)
+            ctx.show_text(label)
+        
+        # X-axis labels (distance)
+        for i in range(6):
+            distance = (i / 5) * total_distance
+            x = margin_left + (i / 5) * chart_width
+            label = f"{distance:.1f}km"
+            
+            text_extents = ctx.text_extents(label)
+            ctx.move_to(x - text_extents.width / 2, margin_top + chart_height + 20)
+            ctx.show_text(label)
+        
+        # Current info
+        ctx.set_font_size(14)
+        current_info = f"Current: {interpolated_point.elevation:.1f}m at {current_distance:.1f}km"
+        text_extents = ctx.text_extents(current_info)
+        ctx.move_to(chart_size[0] - text_extents.width - 10, chart_size[1] - 10)
+        ctx.show_text(current_info)
+        
+        # Convert Cairo surface to bytes
+        buf = surface.get_data()
+        img_array = np.ndarray(shape=(chart_size[1], chart_size[0], 4), 
+                             dtype=np.uint8, buffer=buf)
+        # Cairo uses BGRA, convert to RGBA
+        img_array = img_array[:, :, [2, 1, 0, 3]]
+        
+        return img_array
+    
+    generate_video_frames(
+        output_path=output_path,
+        size=chart_size,
+        overlay_fps=overlay_fps,
+        frame_generator=generate_frame,
+    )
 
 def generate_speedometer_video(
     track_points: List[GPSTrackPoint],
@@ -574,191 +587,177 @@ def generate_speedometer_video(
     radius = min(size) // 2 - 20  # Leave some margin
     max_speed = 60.0  # Maximum speed in km/h
     
-    # Start FFmpeg process
-    process = (
-        ffmpeg
-        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
-               s=f'{size[0]}x{size[1]}', r=overlay_fps)
-        .output(output_path, vcodec='prores_ks', profile='4444', 
-                pix_fmt='yuva444p10le', r=overlay_fps)
-        .overwrite_output()
-        .run_async(pipe_stdin=True)
-    )
-    
-    try:
-        for frame_num in range(total_frames):
-            frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
-            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
-            current_speed = calculate_speed_interpolated(interpolated_point, track_points, speed_window)
+    def generate_frame(frame_num: int) -> np.ndarray:
+        if frame_num >= total_frames:
+            return None
             
-            # Create Cairo surface
-            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size[0], size[1])
-            ctx = cairo.Context(surface)
+        frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+        interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+        current_speed = calculate_speed_interpolated(interpolated_point, track_points, speed_window)
+        
+        # Create Cairo surface
+        surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size[0], size[1])
+        ctx = cairo.Context(surface)
+        
+        # Clear with transparent background
+        ctx.set_source_rgba(0, 0, 0, 0)
+        ctx.paint()
+        
+        # Draw speedometer background with glow effect
+        # Outer glow
+        ctx.set_line_width(20)
+        ctx.set_source_rgba(0, 0, 0, 0.3)
+        ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
+        ctx.stroke()
+        
+        # Main background
+        ctx.set_line_width(15)
+        ctx.set_source_rgba(0.2, 0.2, 0.2, 0.9)
+        ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
+        ctx.stroke()
+        
+        # Draw speedometer ticks and numbers
+        ctx.set_line_width(2)
+        ctx.set_source_rgba(1, 1, 1, 0.9)
+        ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+        ctx.set_font_size(16)
+        
+        # Draw major ticks and numbers
+        for i in range(7):  # 0, 10, 20, ..., 60
+            speed = i * 10
+            angle = (speed / max_speed) * 1.8 * 3.14159  # 1.8π for almost full circle
             
-            # Clear with transparent background
-            ctx.set_source_rgba(0, 0, 0, 0)
-            ctx.paint()
+            # Calculate tick position
+            tick_x = center_x + (radius - 10) * math.sin(angle)
+            tick_y = center_y - (radius - 10) * math.cos(angle)
             
-            # Draw speedometer background with glow effect
-            # Outer glow
-            ctx.set_line_width(20)
-            ctx.set_source_rgba(0, 0, 0, 0.3)
-            ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
+            # Draw tick with glow
+            ctx.set_line_width(4)
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                      center_y - (radius - 20) * math.cos(angle))
+            ctx.line_to(tick_x, tick_y)
             ctx.stroke()
             
-            # Main background
-            ctx.set_line_width(15)
-            ctx.set_source_rgba(0.2, 0.2, 0.2, 0.9)
-            ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
-            ctx.stroke()
-            
-            # Draw speedometer ticks and numbers
+            # Draw tick
             ctx.set_line_width(2)
             ctx.set_source_rgba(1, 1, 1, 0.9)
-            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
-            ctx.set_font_size(16)
-            
-            # Draw major ticks and numbers
-            for i in range(7):  # 0, 10, 20, ..., 60
-                speed = i * 10
-                angle = (speed / max_speed) * 1.8 * 3.14159  # 1.8π for almost full circle
-                
-                # Calculate tick position
-                tick_x = center_x + (radius - 10) * math.sin(angle)
-                tick_y = center_y - (radius - 10) * math.cos(angle)
-                
-                # Draw tick with glow
-                ctx.set_line_width(4)
-                ctx.set_source_rgba(0, 0, 0, 0.5)
-                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
-                          center_y - (radius - 20) * math.cos(angle))
-                ctx.line_to(tick_x, tick_y)
-                ctx.stroke()
-                
-                # Draw tick
-                ctx.set_line_width(2)
-                ctx.set_source_rgba(1, 1, 1, 0.9)
-                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
-                          center_y - (radius - 20) * math.cos(angle))
-                ctx.line_to(tick_x, tick_y)
-                ctx.stroke()
-                
-                # Draw number with glow
-                text = str(speed)
-                text_extents = ctx.text_extents(text)
-                
-                # Draw text shadow
-                ctx.set_source_rgba(0, 0, 0, 0.5)
-                ctx.move_to(tick_x - text_extents.width/2 + 1,
-                          tick_y + text_extents.height/2 + 1)
-                ctx.show_text(text)
-                
-                # Draw text
-                ctx.set_source_rgba(1, 1, 1, 0.9)
-                ctx.move_to(tick_x - text_extents.width/2,
-                          tick_y + text_extents.height/2)
-                ctx.show_text(text)
-            
-            # Draw minor ticks
-            ctx.set_line_width(1)
-            for i in range(61):  # 0, 1, 2, ..., 60
-                if i % 10 == 0:  # Skip major ticks
-                    continue
-                angle = (i / max_speed) * 1.8 * 3.14159
-                
-                # Calculate tick position
-                tick_x = center_x + (radius - 15) * math.sin(angle)
-                tick_y = center_y - (radius - 15) * math.cos(angle)
-                
-                # Draw tick with glow
-                ctx.set_line_width(2)
-                ctx.set_source_rgba(0, 0, 0, 0.3)
-                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
-                          center_y - (radius - 20) * math.cos(angle))
-                ctx.line_to(tick_x, tick_y)
-                ctx.stroke()
-                
-                # Draw tick
-                ctx.set_line_width(1)
-                ctx.set_source_rgba(1, 1, 1, 0.7)
-                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
-                          center_y - (radius - 20) * math.cos(angle))
-                ctx.line_to(tick_x, tick_y)
-                ctx.stroke()
-            
-            # Draw speed hand with glow effect
-            hand_angle = (current_speed / max_speed) * 1.8 * 3.14159
-            hand_length = radius - 30
-            
-            # Draw hand outer glow
-            ctx.set_line_width(8)
-            ctx.set_source_rgba(0, 0, 0, 0.5)
-            ctx.move_to(center_x, center_y)
-            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
-                       center_y - hand_length * math.cos(hand_angle))
+            ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                      center_y - (radius - 20) * math.cos(angle))
+            ctx.line_to(tick_x, tick_y)
             ctx.stroke()
             
-            # Draw hand shadow
-            ctx.set_line_width(6)
-            ctx.set_source_rgba(0, 0, 0, 0.5)
-            ctx.move_to(center_x, center_y)
-            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
-                       center_y - hand_length * math.cos(hand_angle))
-            ctx.stroke()
-            
-            # Draw hand
-            ctx.set_line_width(4)
-            ctx.set_source_rgba(1, 0.2, 0.2, 1)
-            ctx.move_to(center_x, center_y)
-            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
-                       center_y - hand_length * math.cos(hand_angle))
-            ctx.stroke()
-            
-            # Draw center circle with glow
-            # Outer glow
-            ctx.set_source_rgba(0, 0, 0, 0.5)
-            ctx.arc(center_x, center_y, 18, 0, 2 * 3.14159)
-            ctx.fill()
-            
-            # Main circle
-            ctx.set_source_rgba(0.3, 0.3, 0.3, 0.9)
-            ctx.arc(center_x, center_y, 15, 0, 2 * 3.14159)
-            ctx.fill()
-            
-            # Draw current speed text with glow
-            ctx.set_font_size(24)
-            speed_text = f"{current_speed:.1f} km/h"
-            text_extents = ctx.text_extents(speed_text)
+            # Draw number with glow
+            text = str(speed)
+            text_extents = ctx.text_extents(text)
             
             # Draw text shadow
             ctx.set_source_rgba(0, 0, 0, 0.5)
-            ctx.move_to(center_x - text_extents.width/2 + 2,
-                       center_y + radius/2 + 2)
-            ctx.show_text(speed_text)
+            ctx.move_to(tick_x - text_extents.width/2 + 1,
+                      tick_y + text_extents.height/2 + 1)
+            ctx.show_text(text)
             
             # Draw text
             ctx.set_source_rgba(1, 1, 1, 0.9)
-            ctx.move_to(center_x - text_extents.width/2,
-                       center_y + radius/2)
-            ctx.show_text(speed_text)
-            
-            # Convert Cairo surface to bytes
-            buf = surface.get_data()
-            img_array = np.ndarray(shape=(size[1], size[0], 4), 
-                                 dtype=np.uint8, buffer=buf)
-            # Cairo uses BGRA, convert to RGBA
-            img_array = img_array[:, :, [2, 1, 0, 3]]
-            
-            # Write frame
-            process.stdin.write(img_array.tobytes())
-            
-            progress = (frame_num + 1) / total_frames * 100
-            print(f"\rGenerating speedometer video: {progress:.1f}%", end='', flush=True)
+            ctx.move_to(tick_x - text_extents.width/2,
+                      tick_y + text_extents.height/2)
+            ctx.show_text(text)
         
-        print()
+        # Draw minor ticks
+        ctx.set_line_width(1)
+        for i in range(61):  # 0, 1, 2, ..., 60
+            if i % 10 == 0:  # Skip major ticks
+                continue
+            angle = (i / max_speed) * 1.8 * 3.14159
+            
+            # Calculate tick position
+            tick_x = center_x + (radius - 15) * math.sin(angle)
+            tick_y = center_y - (radius - 15) * math.cos(angle)
+            
+            # Draw tick with glow
+            ctx.set_line_width(2)
+            ctx.set_source_rgba(0, 0, 0, 0.3)
+            ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                      center_y - (radius - 20) * math.cos(angle))
+            ctx.line_to(tick_x, tick_y)
+            ctx.stroke()
+            
+            # Draw tick
+            ctx.set_line_width(1)
+            ctx.set_source_rgba(1, 1, 1, 0.7)
+            ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                      center_y - (radius - 20) * math.cos(angle))
+            ctx.line_to(tick_x, tick_y)
+            ctx.stroke()
         
-    except Exception as e:
-        raise Exception(f"Error generating speedometer video: {str(e)}")
-    finally:
-        process.stdin.close()
-        process.wait()
+        # Draw speed hand with glow effect
+        hand_angle = (current_speed / max_speed) * 1.8 * 3.14159
+        hand_length = radius - 30
+        
+        # Draw hand outer glow
+        ctx.set_line_width(8)
+        ctx.set_source_rgba(0, 0, 0, 0.5)
+        ctx.move_to(center_x, center_y)
+        ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                   center_y - hand_length * math.cos(hand_angle))
+        ctx.stroke()
+        
+        # Draw hand shadow
+        ctx.set_line_width(6)
+        ctx.set_source_rgba(0, 0, 0, 0.5)
+        ctx.move_to(center_x, center_y)
+        ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                   center_y - hand_length * math.cos(hand_angle))
+        ctx.stroke()
+        
+        # Draw hand
+        ctx.set_line_width(4)
+        ctx.set_source_rgba(1, 0.2, 0.2, 1)
+        ctx.move_to(center_x, center_y)
+        ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                   center_y - hand_length * math.cos(hand_angle))
+        ctx.stroke()
+        
+        # Draw center circle with glow
+        # Outer glow
+        ctx.set_source_rgba(0, 0, 0, 0.5)
+        ctx.arc(center_x, center_y, 18, 0, 2 * 3.14159)
+        ctx.fill()
+        
+        # Main circle
+        ctx.set_source_rgba(0.3, 0.3, 0.3, 0.9)
+        ctx.arc(center_x, center_y, 15, 0, 2 * 3.14159)
+        ctx.fill()
+        
+        # Draw current speed text with glow
+        ctx.set_font_size(24)
+        speed_text = f"{current_speed:.1f} km/h"
+        text_extents = ctx.text_extents(speed_text)
+        
+        # Draw text shadow
+        ctx.set_source_rgba(0, 0, 0, 0.5)
+        ctx.move_to(center_x - text_extents.width/2 + 2,
+                   center_y + radius/2 + 2)
+        ctx.show_text(speed_text)
+        
+        # Draw text
+        ctx.set_source_rgba(1, 1, 1, 0.9)
+        ctx.move_to(center_x - text_extents.width/2,
+                   center_y + radius/2)
+        ctx.show_text(speed_text)
+        
+        # Convert Cairo surface to bytes
+        buf = surface.get_data()
+        img_array = np.ndarray(shape=(size[1], size[0], 4), 
+                             dtype=np.uint8, buffer=buf)
+        # Cairo uses BGRA, convert to RGBA
+        img_array = img_array[:, :, [2, 1, 0, 3]]
+        
+        return img_array
+    
+    generate_video_frames(
+        output_path=output_path,
+        size=size,
+        overlay_fps=overlay_fps,
+        frame_generator=generate_frame,
+    )
