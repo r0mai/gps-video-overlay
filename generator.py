@@ -30,8 +30,6 @@ class OverlaySettings:
     video_path: str
     x: int
     y: int
-    width: int
-    height: int
 
 def parse_gpx_file(gpx_path: str) -> list[GPSTrackPoint]:
     """
@@ -137,7 +135,6 @@ def extract_video_metadata(video_path):
 # ---------------------------------------------------------------------------
 
 def composite_video_with_overlays(
-    metadata: VideoMetadata,
     video_path: str,
     overlay_settings: List[OverlaySettings],
     output_path: str,
@@ -179,7 +176,7 @@ def composite_video_with_overlays(
         current_video = base_in.video
         
         # Process each overlay
-        for i, overlay_setting in enumerate(overlay_settings):
+        for overlay_setting in overlay_settings:
             # Load overlay video
             overlay_in = ffmpeg.input(overlay_setting.video_path)
             overlay_video = overlay_in.video  # isolate the video stream
@@ -305,8 +302,6 @@ def main():
             video_path=map_overlay_video_path,
             x=10,
             y=10,
-            width=map_size[0],
-            height=map_size[1],
         )
 
         # Generate overlay video
