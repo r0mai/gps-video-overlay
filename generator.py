@@ -303,20 +303,20 @@ def main():
         
         map_overlay_settings = OverlaySettings(
             video_path=map_overlay_video_path,
-            x=10,
-            y=10,
+            x=(metadata.width - map_size[0]) // 2,  # Center horizontally
+            y=metadata.height - map_size[1] - 10,  # Keep at bottom
         )
         
         heightmap_overlay_settings = OverlaySettings(
             video_path=heightmap_overlay_video_path,
-            x=metadata.width - heightmap_size[0] - 10,
-            y=metadata.height - heightmap_size[1] - 10,
+            x=metadata.width - heightmap_size[0] - 10,  # Keep at right
+            y=metadata.height - heightmap_size[1] - 10,  # Keep at bottom
         )
 
         speedometer_overlay_settings = OverlaySettings(
             video_path=speedometer_overlay_video_path,
-            x=metadata.width - speedometer_size[0] - 10,
-            y=10,
+            x=10,  # Move to left
+            y=metadata.height - speedometer_size[1] - 10,  # Move to bottom
         )
 
         overlay_settings_list.append(map_overlay_settings)

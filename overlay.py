@@ -282,11 +282,7 @@ def generate_map_video(
         # Draw map background if available
         if map_surface is not None:
             ctx.set_source_surface(map_surface, 0, 0)
-            ctx.paint()
-            
-            # Add semi-transparent overlay to make the track more visible
-            ctx.set_source_rgba(0, 0, 0, 0.2)
-            ctx.paint()
+            ctx.paint_with_alpha(0.85)  # Make map background 85% opaque
         else:
             # Clear with transparent background
             ctx.set_source_rgba(0, 0, 0, 0)
