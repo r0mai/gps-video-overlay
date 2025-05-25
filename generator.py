@@ -147,64 +147,149 @@ def extract_video_metadata(video_path):
     except Exception as e:
         raise Exception(f"Unexpected error: {str(e)}")
 
+def interpolate_gps_point(
+    point1: GPSTrackPoint,
+    point2: GPSTrackPoint,
+    target_time: datetime
+) -> GPSTrackPoint:
+    """
+    Interpolate GPS data between two track points based on a target timestamp.
+    
+    Args:
+        point1: First GPS track point
+        point2: Second GPS track point
+        target_time: Target timestamp to interpolate to
+        
+    Returns:
+        GPSTrackPoint: Interpolated GPS track point
+    """
+    # Calculate the interpolation factor (0.0 to 1.0)
+    time_diff_total = (point2.timestamp - point1.timestamp).total_seconds()
+    time_diff_target = (target_time - point1.timestamp).total_seconds()
+    
+    # Handle edge cases
+    if time_diff_total == 0:
+        return point1
+    
+    factor = time_diff_target / time_diff_total
+    factor = max(0.0, min(1.0, factor))  # Clamp to [0, 1]
+    
+    # Interpolate latitude, longitude, and elevation
+    interpolated_lat = point1.latitude + (point2.latitude - point1.latitude) * factor
+    interpolated_lon = point1.longitude + (point2.longitude - point1.longitude) * factor
+    interpolated_elev = point1.elevation + (point2.elevation - point1.elevation) * factor
+    
+    # For non-numeric fields, use the value from the closest point
+    if factor < 0.5:
+        fix_type = point1.fix_type
+        pdop = point1.pdop
+    else:
+        fix_type = point2.fix_type
+        pdop = point2.pdop
+    
+    return GPSTrackPoint(
+        latitude=interpolated_lat,
+        longitude=interpolated_lon,
+        elevation=interpolated_elev,
+        timestamp=target_time,
+        fix_type=fix_type,
+        pdop=pdop
+    )
 
-def calculate_speed(
-    closest_idx: int,
+def get_interpolated_gps_point(
+    all_points: List[GPSTrackPoint],
+    frame_time: datetime,
+) -> GPSTrackPoint:
+    """
+    Get the interpolated GPS point for a given frame time.
+    """
+    if len(all_points) < 2:
+        return all_points[0]
+    
+    timestamps = [p.timestamp for p in all_points]
+    idx = bisect.bisect_left(timestamps, frame_time)
+
+    if idx == 0:
+        return all_points[0]
+    elif idx >= len(all_points):
+        return all_points[-1]
+    else:
+        return interpolate_gps_point(all_points[idx - 1], all_points[idx], frame_time)
+
+
+def calculate_speed_interpolated(
+    interpolated_point: GPSTrackPoint,
     all_points: List[GPSTrackPoint],
     window_seconds: float = 5.0,
 ) -> float:
-    """Return average speed (km/h) over a *window_seconds* look-back period.
-
-    The function walks backwards from *closest_idx* until the accumulated
-    timespan reaches or exceeds *window_seconds*, then computes the total
-    travelled distance across those segments divided by the actual elapsed
-    time.
-
-    Parameters
-    ----------
-    closest_idx : int
-        Index of the track-point considered the *current* position.
-    all_points : list[GPSTrackPoint]
-        The full ordered list of track points.
-    window_seconds : float, default 5.0
-        Duration (in seconds) over which to average the speed.
     """
-
-    if closest_idx == 0 or window_seconds <= 0:
+    Calculate average speed (km/h) over a window period using an interpolated position.
+    
+    Args:
+        interpolated_point: The interpolated GPS point at current time
+        all_points: List of all GPS track points
+        window_seconds: Time window for speed calculation
+        
+    Returns:
+        float: Speed in km/h
+    """
+    if len(all_points) < 2 or window_seconds <= 0:
         return 0.0
-
-    # Identify the earliest point that is still within the window.
-    current_point = all_points[closest_idx]
-    start_idx = closest_idx
-
-    while (
-        start_idx > 0 and
-        (current_point.timestamp - all_points[start_idx - 1].timestamp).total_seconds() <= window_seconds
-    ):
-        start_idx -= 1
-
-    # If no movement (timestamps equal), bail out.
-    time_diff_sec = (current_point.timestamp - all_points[start_idx].timestamp).total_seconds()
-    if time_diff_sec == 0:
+    
+    # Find the points within the time window
+    target_time = interpolated_point.timestamp
+    start_time = target_time - timedelta(seconds=window_seconds)
+    
+    # Find all points within the window
+    points_in_window = []
+    for point in all_points:
+        if start_time <= point.timestamp <= target_time:
+            points_in_window.append(point)
+    
+    # Add the start point if we need to interpolate at the beginning of the window
+    if points_in_window and points_in_window[0].timestamp > start_time:
+        # Find the point just before the window
+        for i, point in enumerate(all_points):
+            if point.timestamp > start_time:
+                if i > 0:
+                    # Interpolate a point at the exact start of the window
+                    start_point = interpolate_gps_point(
+                        all_points[i-1], 
+                        all_points[i], 
+                        start_time
+                    )
+                    points_in_window.insert(0, start_point)
+                break
+    
+    # Add the interpolated point at the end
+    points_in_window.append(interpolated_point)
+    
+    if len(points_in_window) < 2:
         return 0.0
-
-    # Sum segment distances between consecutive points from start_idx to closest_idx.
+    
+    # Calculate total distance traveled
     from math import radians, sin, cos, sqrt, atan2
-
+    
     def haversine(lat1, lon1, lat2, lon2):
         R = 6371  # km
         dlat = radians(lat2 - lat1)
         dlon = radians(lon2 - lon1)
         a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
         return 2 * R * atan2(sqrt(a), sqrt(1 - a))
-
+    
     distance_km = 0.0
-    for i in range(start_idx, closest_idx):
-        p1, p2 = all_points[i], all_points[i + 1]
+    for i in range(len(points_in_window) - 1):
+        p1, p2 = points_in_window[i], points_in_window[i + 1]
         distance_km += haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
-
+    
+    # Calculate actual time elapsed
+    time_diff_sec = (points_in_window[-1].timestamp - points_in_window[0].timestamp).total_seconds()
+    if time_diff_sec == 0:
+        return 0.0
+    
     speed_kmh = distance_km / (time_diff_sec / 3600.0)
     return speed_kmh
+
 
 # ---------------------------------------------------------------------------
 # Video overlay generation (transparent MOV)                                |
@@ -254,10 +339,6 @@ def generate_map_video(
     except:
         font = ImageFont.load_default()
 
-    # Calculate the duration of the GPS telemetry
-    if len(track_points) < 2:
-        raise ValueError("GPS track must have at least 2 points")
-    
     gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
     
     # Determine how many frames to generate so that the overlay spans the full
@@ -289,21 +370,7 @@ def generate_map_video(
         # Generate frames sequentially and write them to the pipe
         for frame_num in range(total_frames):
             frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
-            
-            # Find the closest GPS point to this timestamp using bisect
-            timestamps = [p.timestamp for p in track_points]
-            closest_idx = bisect.bisect_left(timestamps, frame_time)
-            
-            # Handle edge cases
-            if closest_idx == len(track_points):
-                closest_idx = len(track_points) - 1
-            else:
-                # Compare with previous point to find closest
-                if abs((track_points[closest_idx].timestamp - frame_time).total_seconds()) >= \
-                   abs((track_points[closest_idx-1].timestamp - frame_time).total_seconds()):
-                    closest_idx = closest_idx - 1
-
-            closest_point = track_points[closest_idx]
+            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
             
             # Create a new image for the map
             map_image = Image.new('RGBA', map_size, (0, 0, 0, 0))
@@ -320,7 +387,7 @@ def generate_map_video(
             draw.line(track_points_pixels, fill='blue', width=2)
             
             # Draw the current position
-            current_pos = lat_lon_to_pixel(closest_point.latitude, closest_point.longitude)
+            current_pos = lat_lon_to_pixel(interpolated_point.latitude, interpolated_point.longitude)
             draw.ellipse(
                 (current_pos[0]-8, current_pos[1]-8, current_pos[0]+8, current_pos[1]+8),
                 fill='red',
@@ -330,11 +397,11 @@ def generate_map_video(
             
             # Add GPS information
             info_text = [
-                f"Lat: {closest_point.latitude:.6f}°",
-                f"Lon: {closest_point.longitude:.6f}°",
-                f"Elev: {closest_point.elevation:.1f}m",
-                f"Speed: {calculate_speed(closest_idx, track_points, window_seconds=speed_window):.1f} km/h",
-                f"Time: {closest_point.timestamp.strftime('%H:%M:%S')}"
+                f"Lat: {interpolated_point.latitude:.6f}°",
+                f"Lon: {interpolated_point.longitude:.6f}°",
+                f"Elev: {interpolated_point.elevation:.1f}m",
+                f"Speed: {calculate_speed_interpolated(interpolated_point, track_points, window_seconds=speed_window):.1f} km/h",
+                f"Time: {interpolated_point.timestamp.strftime('%H:%M:%S')}"
             ]
             
             # Draw text with black outline for better visibility
