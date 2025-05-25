@@ -353,7 +353,6 @@ def calculate_speed(
 # ---------------------------------------------------------------------------
 
 def generate_map_video(
-    video_metadata: VideoMetadata,
     track_points: List[GPSTrackPoint],
     output_path: str,
     map_size: tuple = (800, 600),
@@ -397,9 +396,15 @@ def generate_map_video(
     except:
         font = ImageFont.load_default()
 
+    # Calculate the duration of the GPS telemetry
+    if len(track_points) < 2:
+        raise ValueError("GPS track must have at least 2 points")
+    
+    gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
+    
     # Determine how many frames to generate so that the overlay spans the full
-    # duration of the base video (rounded up so we cover the tail).
-    total_frames = int(video_metadata.duration * overlay_fps + 0.5)
+    # duration of the GPS telemetry (rounded up so we cover the tail).
+    total_frames = int(gps_duration * overlay_fps + 0.5)
 
     # Start FFmpeg process to encode the overlay video at the requested fps
     process = (
@@ -662,7 +667,6 @@ def main():
         # Generate overlay video
         if not args.skip_generation:
             generate_map_video(
-                video_metadata=metadata,
                 track_points=track_points,
                 output_path=overlay_video_path,
                 map_size=map_size,
