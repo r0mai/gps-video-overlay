@@ -510,13 +510,7 @@ def generate_heightmap_video(
                 ctx.move_to(x - text_extents.width / 2, margin_top + chart_height + 20)
                 ctx.show_text(label)
             
-            # Title and current info
-            ctx.set_font_size(16)
-            ctx.set_source_rgba(1, 1, 1, 1)
-            title = "Elevation Profile"
-            text_extents = ctx.text_extents(title)
-            ctx.move_to((chart_size[0] - text_extents.width) / 2, 25)
-            ctx.show_text(title)
+            # Current info
             
             # Current elevation info
             ctx.set_font_size(14)
