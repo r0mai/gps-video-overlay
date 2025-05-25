@@ -353,7 +353,7 @@ def main():
             )
         
         # Composite the video with overlays
-        output_video = os.path.join(args.output_dir, "output_with_map.mp4")
+        output_video = os.path.join(args.output_dir, "output.mp4")
         composite_video_with_overlays(
             video_path=args.video_file,
             overlay_settings=overlay_settings_list,
