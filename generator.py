@@ -273,6 +273,7 @@ def main():
     parser.add_argument('--offset-seconds', type=float, default=0, help='Offset in seconds for the overlay layer (positive = delay, negative = advance)')
     parser.add_argument('--speed-window', type=float, default=5.0, help='Time window (in seconds) over which to average the displayed speed')
     parser.add_argument('--overlay-fps', type=float, default=5.0, help='Frame rate (frames per second) for the generated overlay video')
+    parser.add_argument('--use-map-tiles', action='store_true', default=False, help='Use map tiles for the overlay video')
     # Parse arguments
     args = parser.parse_args()
     
@@ -291,6 +292,7 @@ def main():
                 map_size=map_size,
                 overlay_fps=args.overlay_fps,
                 speed_window=args.speed_window,
+                use_map_tiles=args.use_map_tiles
             )
         
         # Composite the video with overlay

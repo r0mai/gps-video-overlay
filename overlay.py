@@ -6,6 +6,8 @@ import ffmpeg
 import bisect
 import cairo
 import numpy as np
+from map_tiles import MapTileProvider
+import traceback
 
 def interpolate_gps_point(
     point1: GPSTrackPoint,
@@ -156,8 +158,9 @@ def generate_map_video(
     map_size: tuple = (800, 600),
     overlay_fps: float = 5.0,
     speed_window: float = 5.0,
+    use_map_tiles: bool = True,
 ) -> None:
-    """Generate overlay using Cairo for advanced graphics."""
+    """Generate overlay using Cairo for advanced graphics with optional map background."""
     
     frame_duration = 1.0 / overlay_fps
     
@@ -175,6 +178,31 @@ def generate_map_video(
     min_lon -= lon_padding
     max_lon += lon_padding
     
+    # Download map tiles if requested
+    map_image = None
+    if use_map_tiles:
+        print("Downloading map tiles...")
+        tile_provider = MapTileProvider()
+        try:
+            pil_map, map_info = tile_provider.create_map_image(
+                min_lat, max_lat, min_lon, max_lon,
+                map_size[0], map_size[1]
+            )
+            # Convert PIL image to numpy array for Cairo
+            map_array = np.array(pil_map)
+            # Add alpha channel if not present
+            if map_array.shape[2] == 3:
+                map_array = np.dstack([map_array, np.full((map_size[1], map_size[0]), 255, dtype=np.uint8)])
+            # Convert RGB to BGR for Cairo (BGRA format)
+            map_array = map_array[:, :, [2, 1, 0, 3]]
+            # Ensure the array is C-contiguous
+            map_image = np.ascontiguousarray(map_array)
+            print("Map tiles downloaded successfully")
+        except Exception as e:
+            print(f"Warning: Could not download map tiles: {e}")
+            print(traceback.format_exc())
+            print("Continuing without map background")
+    
     gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
     total_frames = int(gps_duration * overlay_fps + 0.5)
     
@@ -190,6 +218,16 @@ def generate_map_video(
     )
     
     try:
+        # Create a persistent map surface if we have map tiles
+        map_surface = None
+        if map_image is not None:
+            # Create the map surface once, outside the loop
+            map_surface = cairo.ImageSurface.create_for_data(
+                map_image, cairo.FORMAT_ARGB32, 
+                map_size[0], map_size[1],
+                map_size[0] * 4  # stride = width * 4 bytes per pixel
+            )
+        
         for frame_num in range(total_frames):
             frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
             interpolated_point = get_interpolated_gps_point(track_points, frame_time)
@@ -198,20 +236,40 @@ def generate_map_video(
             surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, map_size[0], map_size[1])
             ctx = cairo.Context(surface)
             
-            # Clear with transparent background
-            ctx.set_source_rgba(0, 0, 0, 0)
-            ctx.paint()
+            # Draw map background if available
+            if map_surface is not None:
+                ctx.set_source_surface(map_surface, 0, 0)
+                ctx.paint()
+                
+                # Add semi-transparent overlay to make the track more visible
+                ctx.set_source_rgba(0, 0, 0, 0.2)
+                ctx.paint()
+            else:
+                # Clear with transparent background
+                ctx.set_source_rgba(0, 0, 0, 0)
+                ctx.paint()
             
             def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
                 x = (lon - min_lon) / (max_lon - min_lon) * map_size[0]
                 y = (1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1]
                 return (x, y)
             
-            # Draw track with gradient
+            # Draw track with enhanced visibility
+            ctx.set_line_width(4)
+            
+            # Draw white outline first
+            ctx.set_source_rgba(1, 1, 1, 0.8)
+            for i, point in enumerate(track_points):
+                x, y = lat_lon_to_pixel(point.latitude, point.longitude)
+                if i == 0:
+                    ctx.move_to(x, y)
+                else:
+                    ctx.line_to(x, y)
+            ctx.stroke()
+            
+            # Draw colored track on top
             ctx.set_line_width(3)
             ctx.set_source_rgb(0.2, 0.4, 1.0)
-            
-            # Draw the track
             for i, point in enumerate(track_points):
                 x, y = lat_lon_to_pixel(point.latitude, point.longitude)
                 if i == 0:
@@ -235,7 +293,7 @@ def generate_map_video(
             ctx.set_source_rgba(1, 1, 1, 1)
             ctx.fill()
             
-            # Add text with better typography
+            # Add text with background for better readability
             ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(20)
             
@@ -247,12 +305,13 @@ def generate_map_video(
                 f"Time: {interpolated_point.timestamp.strftime('%H:%M:%S')}"
             ]
             
+            # Draw background box for text
+            ctx.set_source_rgba(0, 0, 0, 0.7)
+            ctx.rectangle(5, 5, 350, 140)
+            ctx.fill()
+            
             for i, text in enumerate(info_text):
                 y_pos = 30 + i * 25
-                # Text shadow
-                ctx.move_to(13, y_pos + 1)
-                ctx.set_source_rgba(0, 0, 0, 0.8)
-                ctx.show_text(text)
                 # Main text
                 ctx.move_to(12, y_pos)
                 ctx.set_source_rgba(1, 1, 1, 1)
@@ -272,10 +331,9 @@ def generate_map_video(
             print(f"\rGenerating overlay video: {progress:.1f}%", end='', flush=True)
         
         print()
-        process.stdin.close()
-        process.wait()
         
     except Exception as e:
+        raise Exception(f"Error generating overlay video: {str(e)}")
+    finally:
         process.stdin.close()
         process.wait()
-        raise Exception(f"Error generating overlay video: {str(e)}")
