@@ -12,7 +12,7 @@ from typing import List
 import bisect
 import os
 from gps_track_point import GPSTrackPoint
-from overlay import generate_map_video
+from overlay import generate_map_video, generate_heightmap_video
 
 @dataclass
 class VideoMetadata:
@@ -289,18 +289,34 @@ def main():
     
     try:
         track_points = parse_gpx_file(args.gps_file)
+        metadata = extract_video_metadata(args.video_file)
         
         map_size = (800, 600)
-        map_overlay_video_path = os.path.join(args.output_dir, "overlay.mov")
+        heightmap_size = (800, 400)
+        map_overlay_video_path = os.path.join(args.output_dir, "map.mov")
+        heightmap_overlay_video_path = os.path.join(args.output_dir, "heightmap.mov")
 
+        # Prepare overlay settings list
+        overlay_settings_list = []
+        
         map_overlay_settings = OverlaySettings(
             video_path=map_overlay_video_path,
             x=10,
             y=10,
         )
+        
+        heightmap_overlay_settings = OverlaySettings(
+            video_path=heightmap_overlay_video_path,
+            x=metadata.width - heightmap_size[0] - 10,
+            y=metadata.height - heightmap_size[1] - 10,
+        )
 
-        # Generate overlay video
+        overlay_settings_list.append(map_overlay_settings)
+        overlay_settings_list.append(heightmap_overlay_settings)
+
+        # Generate overlay videos
         if not args.skip_generation:
+            # Generate map overlay
             generate_map_video(
                 track_points=track_points,
                 output_path=map_overlay_video_path,
@@ -309,12 +325,20 @@ def main():
                 speed_window=args.speed_window,
                 tile_style=args.tile_style,
             )
+            
+            # Generate heightmap overlay if enabled
+            generate_heightmap_video(
+                track_points=track_points,
+                output_path=heightmap_overlay_video_path,
+                chart_size=heightmap_size,
+                overlay_fps=args.overlay_fps,
+            )
         
-        # Composite the video with overlay
+        # Composite the video with overlays
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
         composite_video_with_overlays(
             video_path=args.video_file,
-            overlay_settings=[map_overlay_settings],
+            overlay_settings=overlay_settings_list,
             output_path=output_video,
             max_duration=args.max_duration,
             offset_seconds=args.offset_seconds

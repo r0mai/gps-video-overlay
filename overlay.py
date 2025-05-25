@@ -337,3 +337,211 @@ def generate_map_video(
     finally:
         process.stdin.close()
         process.wait()
+
+def generate_heightmap_video(
+    track_points: List[GPSTrackPoint],
+    output_path: str,
+    chart_size: tuple = (800, 400),
+    overlay_fps: float = 5.0,
+) -> None:
+    """Generate elevation profile overlay showing height vs time with current position indicator."""
+    
+    frame_duration = 1.0 / overlay_fps
+    
+    # Calculate elevation bounds
+    elevations = [p.elevation for p in track_points if p.elevation is not None]
+    if not elevations:
+        raise ValueError("No elevation data found in track points")
+    
+    min_elevation = min(elevations)
+    max_elevation = max(elevations)
+    
+    # Add padding to elevation range
+    elevation_range = max_elevation - min_elevation
+    if elevation_range == 0:
+        elevation_range = 100  # Default range if all elevations are the same
+    elevation_padding = elevation_range * 0.1
+    min_elevation -= elevation_padding
+    max_elevation += elevation_padding
+    
+    # Calculate time bounds
+    start_time = track_points[0].timestamp
+    end_time = track_points[-1].timestamp
+    total_duration = (end_time - start_time).total_seconds()
+    
+    gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
+    total_frames = int(gps_duration * overlay_fps + 0.5)
+    
+    # Chart margins
+    margin_left = 80
+    margin_right = 40
+    margin_top = 40
+    margin_bottom = 60
+    chart_width = chart_size[0] - margin_left - margin_right
+    chart_height = chart_size[1] - margin_top - margin_bottom
+    
+    # Start FFmpeg process
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
+               s=f'{chart_size[0]}x{chart_size[1]}', r=overlay_fps)
+        .output(output_path, vcodec='prores_ks', profile='4444', 
+                pix_fmt='yuva444p10le', r=overlay_fps)
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    
+    try:
+        for frame_num in range(total_frames):
+            frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+            
+            # Create Cairo surface
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, chart_size[0], chart_size[1])
+            ctx = cairo.Context(surface)
+            
+            # Clear with semi-transparent background
+            ctx.set_source_rgba(0, 0, 0, 0.8)
+            ctx.paint()
+            
+            # Helper functions for coordinate conversion
+            def time_to_x(timestamp: datetime) -> float:
+                time_offset = (timestamp - start_time).total_seconds()
+                return margin_left + (time_offset / total_duration) * chart_width
+            
+            def elevation_to_y(elevation: float) -> float:
+                normalized = (elevation - min_elevation) / (max_elevation - min_elevation)
+                return margin_top + chart_height - (normalized * chart_height)
+            
+            # Draw grid lines
+            ctx.set_line_width(1)
+            ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8)
+            
+            # Vertical grid lines (time)
+            for i in range(6):  # 5 intervals
+                x = margin_left + (i / 5) * chart_width
+                ctx.move_to(x, margin_top)
+                ctx.line_to(x, margin_top + chart_height)
+                ctx.stroke()
+            
+            # Horizontal grid lines (elevation)
+            for i in range(6):  # 5 intervals
+                y = margin_top + (i / 5) * chart_height
+                ctx.move_to(margin_left, y)
+                ctx.line_to(margin_left + chart_width, y)
+                ctx.stroke()
+            
+            # Draw elevation profile
+            ctx.set_line_width(3)
+            ctx.set_source_rgba(0.2, 0.8, 0.2, 1.0)  # Green line
+            
+            for i, point in enumerate(track_points):
+                if point.elevation is None:
+                    continue
+                    
+                x = time_to_x(point.timestamp)
+                y = elevation_to_y(point.elevation)
+                
+                if i == 0:
+                    ctx.move_to(x, y)
+                else:
+                    ctx.line_to(x, y)
+            ctx.stroke()
+            
+            # Draw current position indicator
+            current_x = time_to_x(interpolated_point.timestamp)
+            current_y = elevation_to_y(interpolated_point.elevation)
+            
+            # Vertical line at current time
+            ctx.set_line_width(2)
+            ctx.set_source_rgba(1, 0, 0, 0.8)  # Red line
+            ctx.move_to(current_x, margin_top)
+            ctx.line_to(current_x, margin_top + chart_height)
+            ctx.stroke()
+            
+            # Current position dot
+            ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
+            ctx.set_source_rgba(1, 0, 0, 1)  # Red dot
+            ctx.fill()
+            
+            # White outline for dot
+            ctx.arc(current_x, current_y, 6, 0, 2 * 3.14159)
+            ctx.set_source_rgba(1, 1, 1, 1)
+            ctx.set_line_width(2)
+            ctx.stroke()
+            
+            # Draw axes
+            ctx.set_line_width(2)
+            ctx.set_source_rgba(1, 1, 1, 1)
+            
+            # Y-axis
+            ctx.move_to(margin_left, margin_top)
+            ctx.line_to(margin_left, margin_top + chart_height)
+            ctx.stroke()
+            
+            # X-axis
+            ctx.move_to(margin_left, margin_top + chart_height)
+            ctx.line_to(margin_left + chart_width, margin_top + chart_height)
+            ctx.stroke()
+            
+            # Add labels
+            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_NORMAL)
+            ctx.set_font_size(12)
+            ctx.set_source_rgba(1, 1, 1, 1)
+            
+            # Y-axis labels (elevation)
+            for i in range(6):
+                elevation = min_elevation + (i / 5) * (max_elevation - min_elevation)
+                y = margin_top + chart_height - (i / 5) * chart_height
+                label = f"{elevation:.0f}m"
+                
+                text_extents = ctx.text_extents(label)
+                ctx.move_to(margin_left - text_extents.width - 10, y + text_extents.height / 2)
+                ctx.show_text(label)
+            
+            # X-axis labels (time)
+            for i in range(6):
+                time_offset = (i / 5) * total_duration
+                timestamp = start_time + timedelta(seconds=time_offset)
+                x = margin_left + (i / 5) * chart_width
+                label = timestamp.strftime('%H:%M')
+                
+                text_extents = ctx.text_extents(label)
+                ctx.move_to(x - text_extents.width / 2, margin_top + chart_height + 20)
+                ctx.show_text(label)
+            
+            # Title and current info
+            ctx.set_font_size(16)
+            ctx.set_source_rgba(1, 1, 1, 1)
+            title = "Elevation Profile"
+            text_extents = ctx.text_extents(title)
+            ctx.move_to((chart_size[0] - text_extents.width) / 2, 25)
+            ctx.show_text(title)
+            
+            # Current elevation info
+            ctx.set_font_size(14)
+            current_info = f"Current: {interpolated_point.elevation:.1f}m at {interpolated_point.timestamp.strftime('%H:%M:%S')}"
+            text_extents = ctx.text_extents(current_info)
+            ctx.move_to(chart_size[0] - text_extents.width - 10, chart_size[1] - 10)
+            ctx.show_text(current_info)
+            
+            # Convert Cairo surface to bytes
+            buf = surface.get_data()
+            img_array = np.ndarray(shape=(chart_size[1], chart_size[0], 4), 
+                                 dtype=np.uint8, buffer=buf)
+            # Cairo uses BGRA, convert to RGBA
+            img_array = img_array[:, :, [2, 1, 0, 3]]
+            
+            # Write frame
+            process.stdin.write(img_array.tobytes())
+            
+            progress = (frame_num + 1) / total_frames * 100
+            print(f"\rGenerating heightmap video: {progress:.1f}%", end='', flush=True)
+        
+        print()
+        
+    except Exception as e:
+        raise Exception(f"Error generating heightmap video: {str(e)}")
+    finally:
+        process.stdin.close()
+        process.wait()
