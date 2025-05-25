@@ -149,20 +149,20 @@ def extract_video_metadata(video_path):
 
 
 def calculate_speed(
-    closes_idx: int,
+    closest_idx: int,
     all_points: List[GPSTrackPoint],
     window_seconds: float = 5.0,
 ) -> float:
     """Return average speed (km/h) over a *window_seconds* look-back period.
 
-    The function walks backwards from *closes_idx* until the accumulated
+    The function walks backwards from *closest_idx* until the accumulated
     timespan reaches or exceeds *window_seconds*, then computes the total
     travelled distance across those segments divided by the actual elapsed
     time.
 
     Parameters
     ----------
-    closes_idx : int
+    closest_idx : int
         Index of the track-point considered the *current* position.
     all_points : list[GPSTrackPoint]
         The full ordered list of track points.
@@ -170,12 +170,12 @@ def calculate_speed(
         Duration (in seconds) over which to average the speed.
     """
 
-    if closes_idx == 0 or window_seconds <= 0:
+    if closest_idx == 0 or window_seconds <= 0:
         return 0.0
 
     # Identify the earliest point that is still within the window.
-    current_point = all_points[closes_idx]
-    start_idx = closes_idx
+    current_point = all_points[closest_idx]
+    start_idx = closest_idx
 
     while (
         start_idx > 0 and
@@ -188,7 +188,7 @@ def calculate_speed(
     if time_diff_sec == 0:
         return 0.0
 
-    # Sum segment distances between consecutive points from start_idx to closes_idx.
+    # Sum segment distances between consecutive points from start_idx to closest_idx.
     from math import radians, sin, cos, sqrt, atan2
 
     def haversine(lat1, lon1, lat2, lon2):
@@ -199,7 +199,7 @@ def calculate_speed(
         return 2 * R * atan2(sqrt(a), sqrt(1 - a))
 
     distance_km = 0.0
-    for i in range(start_idx, closes_idx):
+    for i in range(start_idx, closest_idx):
         p1, p2 = all_points[i], all_points[i + 1]
         distance_km += haversine(p1.latitude, p1.longitude, p2.latitude, p2.longitude)
 
