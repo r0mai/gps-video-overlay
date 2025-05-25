@@ -148,10 +148,6 @@ def composite_video_with_overlays(
 
     Parameters
     ----------
-    metadata : VideoMetadata
-        Metadata of the *original* video.  Currently only used for sanity
-        checks; supplying it keeps the call-site symmetrical with the other
-        helper functions.
     video_path : str
         Path to the original/base video.
     overlay_settings : List[OverlaySettings]
@@ -292,7 +288,6 @@ def main():
     args = parser.parse_args()
     
     try:
-        metadata = extract_video_metadata(args.video_file)
         track_points = parse_gpx_file(args.gps_file)
         
         map_size = (800, 600)
@@ -318,7 +313,6 @@ def main():
         # Composite the video with overlay
         output_video = os.path.join(args.output_dir, "output_with_map.mp4")
         composite_video_with_overlays(
-            metadata=metadata,
             video_path=args.video_file,
             overlay_settings=[map_overlay_settings],
             output_path=output_video,
