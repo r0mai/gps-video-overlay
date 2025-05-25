@@ -8,6 +8,7 @@ import cairo
 import numpy as np
 from map_tiles import MapTileProvider
 import traceback
+import math
 
 def interpolate_gps_point(
     point1: GPSTrackPoint,
@@ -297,26 +298,6 @@ def generate_map_video(
             ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
             ctx.set_font_size(20)
             
-            info_text = [
-                f"Lat: {interpolated_point.latitude:.6f}°",
-                f"Lon: {interpolated_point.longitude:.6f}°",
-                f"Elev: {interpolated_point.elevation:.1f}m",
-                f"Speed: {calculate_speed_interpolated(interpolated_point, track_points, speed_window):.1f} km/h",
-                f"Time: {interpolated_point.timestamp.strftime('%H:%M:%S')}"
-            ]
-            
-            # Draw background box for text
-            ctx.set_source_rgba(0, 0, 0, 0.7)
-            ctx.rectangle(5, 5, 350, 140)
-            ctx.fill()
-            
-            for i, text in enumerate(info_text):
-                y_pos = 30 + i * 25
-                # Main text
-                ctx.move_to(12, y_pos)
-                ctx.set_source_rgba(1, 1, 1, 1)
-                ctx.show_text(text)
-            
             # Convert Cairo surface to bytes
             buf = surface.get_data()
             img_array = np.ndarray(shape=(map_size[1], map_size[0], 4), 
@@ -566,6 +547,218 @@ def generate_heightmap_video(
         
     except Exception as e:
         raise Exception(f"Error generating heightmap video: {str(e)}")
+    finally:
+        process.stdin.close()
+        process.wait()
+
+def generate_speedometer_video(
+    track_points: List[GPSTrackPoint],
+    output_path: str,
+    size: tuple = (400, 400),
+    overlay_fps: float = 5.0,
+    speed_window: float = 5.0,
+) -> None:
+    """Generate a speedometer overlay showing current speed with a moving hand."""
+    
+    frame_duration = 1.0 / overlay_fps
+    
+    # Calculate time bounds for frame generation
+    start_time = track_points[0].timestamp
+    end_time = track_points[-1].timestamp
+    gps_duration = (end_time - start_time).total_seconds()
+    total_frames = int(gps_duration * overlay_fps + 0.5)
+    
+    # Speedometer parameters
+    center_x = size[0] // 2
+    center_y = size[1] // 2
+    radius = min(size) // 2 - 20  # Leave some margin
+    max_speed = 60.0  # Maximum speed in km/h
+    
+    # Start FFmpeg process
+    process = (
+        ffmpeg
+        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
+               s=f'{size[0]}x{size[1]}', r=overlay_fps)
+        .output(output_path, vcodec='prores_ks', profile='4444', 
+                pix_fmt='yuva444p10le', r=overlay_fps)
+        .overwrite_output()
+        .run_async(pipe_stdin=True)
+    )
+    
+    try:
+        for frame_num in range(total_frames):
+            frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
+            interpolated_point = get_interpolated_gps_point(track_points, frame_time)
+            current_speed = calculate_speed_interpolated(interpolated_point, track_points, speed_window)
+            
+            # Create Cairo surface
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, size[0], size[1])
+            ctx = cairo.Context(surface)
+            
+            # Clear with transparent background
+            ctx.set_source_rgba(0, 0, 0, 0)
+            ctx.paint()
+            
+            # Draw speedometer background with glow effect
+            # Outer glow
+            ctx.set_line_width(20)
+            ctx.set_source_rgba(0, 0, 0, 0.3)
+            ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
+            ctx.stroke()
+            
+            # Main background
+            ctx.set_line_width(15)
+            ctx.set_source_rgba(0.2, 0.2, 0.2, 0.9)
+            ctx.arc(center_x, center_y, radius, 0, 2 * 3.14159)
+            ctx.stroke()
+            
+            # Draw speedometer ticks and numbers
+            ctx.set_line_width(2)
+            ctx.set_source_rgba(1, 1, 1, 0.9)
+            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(16)
+            
+            # Draw major ticks and numbers
+            for i in range(7):  # 0, 10, 20, ..., 60
+                speed = i * 10
+                angle = (speed / max_speed) * 1.8 * 3.14159  # 1.8π for almost full circle
+                
+                # Calculate tick position
+                tick_x = center_x + (radius - 10) * math.sin(angle)
+                tick_y = center_y - (radius - 10) * math.cos(angle)
+                
+                # Draw tick with glow
+                ctx.set_line_width(4)
+                ctx.set_source_rgba(0, 0, 0, 0.5)
+                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                          center_y - (radius - 20) * math.cos(angle))
+                ctx.line_to(tick_x, tick_y)
+                ctx.stroke()
+                
+                # Draw tick
+                ctx.set_line_width(2)
+                ctx.set_source_rgba(1, 1, 1, 0.9)
+                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                          center_y - (radius - 20) * math.cos(angle))
+                ctx.line_to(tick_x, tick_y)
+                ctx.stroke()
+                
+                # Draw number with glow
+                text = str(speed)
+                text_extents = ctx.text_extents(text)
+                
+                # Draw text shadow
+                ctx.set_source_rgba(0, 0, 0, 0.5)
+                ctx.move_to(tick_x - text_extents.width/2 + 1,
+                          tick_y + text_extents.height/2 + 1)
+                ctx.show_text(text)
+                
+                # Draw text
+                ctx.set_source_rgba(1, 1, 1, 0.9)
+                ctx.move_to(tick_x - text_extents.width/2,
+                          tick_y + text_extents.height/2)
+                ctx.show_text(text)
+            
+            # Draw minor ticks
+            ctx.set_line_width(1)
+            for i in range(61):  # 0, 1, 2, ..., 60
+                if i % 10 == 0:  # Skip major ticks
+                    continue
+                angle = (i / max_speed) * 1.8 * 3.14159
+                
+                # Calculate tick position
+                tick_x = center_x + (radius - 15) * math.sin(angle)
+                tick_y = center_y - (radius - 15) * math.cos(angle)
+                
+                # Draw tick with glow
+                ctx.set_line_width(2)
+                ctx.set_source_rgba(0, 0, 0, 0.3)
+                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                          center_y - (radius - 20) * math.cos(angle))
+                ctx.line_to(tick_x, tick_y)
+                ctx.stroke()
+                
+                # Draw tick
+                ctx.set_line_width(1)
+                ctx.set_source_rgba(1, 1, 1, 0.7)
+                ctx.move_to(center_x + (radius - 20) * math.sin(angle),
+                          center_y - (radius - 20) * math.cos(angle))
+                ctx.line_to(tick_x, tick_y)
+                ctx.stroke()
+            
+            # Draw speed hand with glow effect
+            hand_angle = (current_speed / max_speed) * 1.8 * 3.14159
+            hand_length = radius - 30
+            
+            # Draw hand outer glow
+            ctx.set_line_width(8)
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.move_to(center_x, center_y)
+            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                       center_y - hand_length * math.cos(hand_angle))
+            ctx.stroke()
+            
+            # Draw hand shadow
+            ctx.set_line_width(6)
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.move_to(center_x, center_y)
+            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                       center_y - hand_length * math.cos(hand_angle))
+            ctx.stroke()
+            
+            # Draw hand
+            ctx.set_line_width(4)
+            ctx.set_source_rgba(1, 0.2, 0.2, 1)
+            ctx.move_to(center_x, center_y)
+            ctx.line_to(center_x + hand_length * math.sin(hand_angle),
+                       center_y - hand_length * math.cos(hand_angle))
+            ctx.stroke()
+            
+            # Draw center circle with glow
+            # Outer glow
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.arc(center_x, center_y, 18, 0, 2 * 3.14159)
+            ctx.fill()
+            
+            # Main circle
+            ctx.set_source_rgba(0.3, 0.3, 0.3, 0.9)
+            ctx.arc(center_x, center_y, 15, 0, 2 * 3.14159)
+            ctx.fill()
+            
+            # Draw current speed text with glow
+            ctx.set_font_size(24)
+            speed_text = f"{current_speed:.1f} km/h"
+            text_extents = ctx.text_extents(speed_text)
+            
+            # Draw text shadow
+            ctx.set_source_rgba(0, 0, 0, 0.5)
+            ctx.move_to(center_x - text_extents.width/2 + 2,
+                       center_y + radius/2 + 2)
+            ctx.show_text(speed_text)
+            
+            # Draw text
+            ctx.set_source_rgba(1, 1, 1, 0.9)
+            ctx.move_to(center_x - text_extents.width/2,
+                       center_y + radius/2)
+            ctx.show_text(speed_text)
+            
+            # Convert Cairo surface to bytes
+            buf = surface.get_data()
+            img_array = np.ndarray(shape=(size[1], size[0], 4), 
+                                 dtype=np.uint8, buffer=buf)
+            # Cairo uses BGRA, convert to RGBA
+            img_array = img_array[:, :, [2, 1, 0, 3]]
+            
+            # Write frame
+            process.stdin.write(img_array.tobytes())
+            
+            progress = (frame_num + 1) / total_frames * 100
+            print(f"\rGenerating speedometer video: {progress:.1f}%", end='', flush=True)
+        
+        print()
+        
+    except Exception as e:
+        raise Exception(f"Error generating speedometer video: {str(e)}")
     finally:
         process.stdin.close()
         process.wait()

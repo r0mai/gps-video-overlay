@@ -12,7 +12,7 @@ from typing import List
 import bisect
 import os
 from gps_track_point import GPSTrackPoint
-from overlay import generate_map_video, generate_heightmap_video
+from overlay import generate_map_video, generate_heightmap_video, generate_speedometer_video
 
 @dataclass
 class VideoMetadata:
@@ -293,8 +293,10 @@ def main():
         
         map_size = (800, 600)
         heightmap_size = (800, 400)
+        speedometer_size = (400, 400)
         map_overlay_video_path = os.path.join(args.output_dir, "map.mov")
         heightmap_overlay_video_path = os.path.join(args.output_dir, "heightmap.mov")
+        speedometer_overlay_video_path = os.path.join(args.output_dir, "speedometer.mov")
 
         # Prepare overlay settings list
         overlay_settings_list = []
@@ -311,8 +313,15 @@ def main():
             y=metadata.height - heightmap_size[1] - 10,
         )
 
+        speedometer_overlay_settings = OverlaySettings(
+            video_path=speedometer_overlay_video_path,
+            x=metadata.width - speedometer_size[0] - 10,
+            y=10,
+        )
+
         overlay_settings_list.append(map_overlay_settings)
         overlay_settings_list.append(heightmap_overlay_settings)
+        overlay_settings_list.append(speedometer_overlay_settings)
 
         # Generate overlay videos
         if not args.skip_generation:
@@ -332,6 +341,15 @@ def main():
                 output_path=heightmap_overlay_video_path,
                 chart_size=heightmap_size,
                 overlay_fps=args.overlay_fps,
+            )
+
+            # Generate speedometer overlay
+            generate_speedometer_video(
+                track_points=track_points,
+                output_path=speedometer_overlay_video_path,
+                size=speedometer_size,
+                overlay_fps=args.overlay_fps,
+                speed_window=args.speed_window,
             )
         
         # Composite the video with overlays
