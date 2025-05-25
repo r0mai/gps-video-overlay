@@ -158,7 +158,7 @@ def generate_map_video(
     map_size: tuple = (800, 600),
     overlay_fps: float = 5.0,
     speed_window: float = 5.0,
-    use_map_tiles: bool = True,
+    tile_style: str = "none",
 ) -> None:
     """Generate overlay using Cairo for advanced graphics with optional map background."""
     
@@ -180,9 +180,9 @@ def generate_map_video(
     
     # Download map tiles if requested
     map_image = None
-    if use_map_tiles:
+    if tile_style != "none":
         print("Downloading map tiles...")
-        tile_provider = MapTileProvider()
+        tile_provider = MapTileProvider(style=tile_style)
         try:
             pil_map, map_info = tile_provider.create_map_image(
                 min_lat, max_lat, min_lon, max_lon,

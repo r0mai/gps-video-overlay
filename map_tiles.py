@@ -6,16 +6,80 @@ from typing import Tuple, List
 import time
 
 class MapTileProvider:
-    """Handle downloading and caching of map tiles from OpenStreetMap."""
+    """Handle downloading and caching of map tiles from various providers."""
     
-    def __init__(self, cache_dir: str = "map_cache"):
+    # Available tile styles
+    TILE_STYLES = {
+        'osm': {
+            'name': 'OpenStreetMap Standard',
+            'url': 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+            'attribution': '© OpenStreetMap contributors',
+            'max_zoom': 19
+        },
+        'cyclosm': {
+            'name': 'CyclOSM (Cycling)',
+            'url': 'https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png',
+            'attribution': '© CyclOSM, © OpenStreetMap contributors',
+            'max_zoom': 20
+        },
+        'cyclosm-lite': {
+            'name': 'CyclOSM Lite (Cycling Overlay)',
+            'url': 'https://a.tile-cyclosm.openstreetmap.fr/cyclosm-lite/{z}/{x}/{y}.png',
+            'attribution': '© CyclOSM, © OpenStreetMap contributors',
+            'max_zoom': 20
+        },
+        'humanitarian': {
+            'name': 'Humanitarian',
+            'url': 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
+            'attribution': '© Humanitarian OpenStreetMap Team, © OpenStreetMap contributors',
+            'max_zoom': 20
+        },
+        'osmfr': {
+            'name': 'OSM France',
+            'url': 'https://a.tile.openstreetmap.fr/osmfr/{z}/{x}/{y}.png',
+            'attribution': '© OpenStreetMap France, © OpenStreetMap contributors',
+            'max_zoom': 20
+        },
+        'opentopomap': {
+            'name': 'OpenTopoMap (Topographic)',
+            'url': 'https://a.tile.opentopomap.org/{z}/{x}/{y}.png',
+            'attribution': '© OpenTopoMap (CC-BY-SA), © OpenStreetMap contributors',
+            'max_zoom': 17
+        },
+        'stamen-toner': {
+            'name': 'Stamen Toner (Black & White)',
+            'url': 'https://tiles.stadiamaps.com/tiles/stamen_toner/{z}/{x}/{y}.png',
+            'attribution': '© Stamen Design, © Stadia Maps, © OpenStreetMap contributors',
+            'max_zoom': 20
+        },
+        'stamen-watercolor': {
+            'name': 'Stamen Watercolor (Artistic)',
+            'url': 'https://tiles.stadiamaps.com/tiles/stamen_watercolor/{z}/{x}/{y}.jpg',
+            'attribution': '© Stamen Design, © Stadia Maps, © OpenStreetMap contributors',
+            'max_zoom': 18
+        }
+    }
+    
+    def __init__(self, cache_dir: str = "map_cache", style: str = "osm"):
         self.cache_dir = cache_dir
         self.tile_size = 256
-        self.base_url = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+        self.style = style
+        
+        if style not in self.TILE_STYLES:
+            print(f"Warning: Unknown style '{style}', using 'osm' instead")
+            self.style = "osm"
+        
+        self.style_config = self.TILE_STYLES[self.style]
+        self.base_url = self.style_config['url']
+        self.max_zoom = self.style_config['max_zoom']
+        
         self.headers = {
-            'User-Agent': 'GPS-Video-Overlay/1.0'  # Required by OSM tile usage policy
+            'User-Agent': 'GPS-Video-Overlay/1.0'  # Required by tile usage policies
         }
         os.makedirs(cache_dir, exist_ok=True)
+        
+        print(f"Using tile style: {self.style_config['name']}")
+        print(f"Attribution: {self.style_config['attribution']}")
     
     def lat_lon_to_tile(self, lat: float, lon: float, zoom: int) -> Tuple[int, int]:
         """Convert latitude/longitude to tile coordinates."""
@@ -35,7 +99,10 @@ class MapTileProvider:
     
     def get_tile(self, x: int, y: int, zoom: int) -> Image.Image:
         """Download a tile or retrieve from cache."""
-        cache_path = os.path.join(self.cache_dir, f"{zoom}_{x}_{y}.png")
+        # Clamp zoom to max supported level
+        zoom = min(zoom, self.max_zoom)
+        
+        cache_path = os.path.join(self.cache_dir, f"{self.style}_{zoom}_{x}_{y}.png")
         
         if os.path.exists(cache_path):
             return Image.open(cache_path)
@@ -50,7 +117,7 @@ class MapTileProvider:
             with open(cache_path, 'wb') as f:
                 f.write(response.content)
             
-            # Be respectful to OSM servers
+            # Be respectful to tile servers
             time.sleep(0.1)
             
             return Image.open(cache_path)
@@ -64,7 +131,8 @@ class MapTileProvider:
                            map_width: int, map_height: int) -> int:
         """Calculate appropriate zoom level for the given bounds and map size."""
         # Calculate zoom level based on the larger dimension
-        for zoom in range(18, 0, -1):
+        max_zoom_to_try = min(18, self.max_zoom)
+        for zoom in range(max_zoom_to_try, 0, -1):
             # Get tile bounds at this zoom
             min_x, max_y = self.lat_lon_to_tile(max_lat, min_lon, zoom)
             max_x, min_y = self.lat_lon_to_tile(min_lat, max_lon, zoom)
