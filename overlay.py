@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 from PIL import Image, ImageDraw, ImageFont
 import ffmpeg
 import bisect
+import cairo
+import numpy as np
 
 def interpolate_gps_point(
     point1: GPSTrackPoint,
@@ -155,30 +157,17 @@ def generate_map_video(
     overlay_fps: float = 5.0,
     speed_window: float = 5.0,
 ) -> None:
-    """
-    Generate a transparent video with GPS path visualization.
+    """Generate overlay using Cairo for advanced graphics."""
     
-    Args:
-        video_metadata: Video metadata containing resolution and fps
-        track_points: List of GPS track points
-        output_path: Path to save the generated video
-        map_size: Size of the visualization in pixels (default: 800x600)
-        overlay_fps: Frame rate (frames per second) for the generated overlay video
-        speed_window: Window duration in seconds for calculating speed
-    """
-    # Calculate frame duration based on *overlay* fps (not the base video fps)
-    if overlay_fps <= 0:
-        raise ValueError("overlay_fps must be greater than zero")
-
     frame_duration = 1.0 / overlay_fps
     
-    # Calculate bounds of the track
+    # Calculate bounds
     min_lat = min(p.latitude for p in track_points)
     max_lat = max(p.latitude for p in track_points)
     min_lon = min(p.longitude for p in track_points)
     max_lon = max(p.longitude for p in track_points)
     
-    # Add some padding to the bounds
+    # Add padding
     lat_padding = (max_lat - min_lat) * 0.1
     lon_padding = (max_lon - min_lon) * 0.1
     min_lat -= lat_padding
@@ -186,102 +175,106 @@ def generate_map_video(
     min_lon -= lon_padding
     max_lon += lon_padding
     
-    # Load font once
-    try:
-        font = ImageFont.truetype("DejaVuSans.ttf", 24)
-    except:
-        font = ImageFont.load_default()
-
     gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
-    
-    # Determine how many frames to generate so that the overlay spans the full
-    # duration of the GPS telemetry (rounded up so we cover the tail).
     total_frames = int(gps_duration * overlay_fps + 0.5)
-
-    # Start FFmpeg process to encode the overlay video at the requested fps
+    
+    # Start FFmpeg process
     process = (
         ffmpeg
-        .input(
-            'pipe:',
-            format='rawvideo',
-            pix_fmt='rgba',
-            s=f'{map_size[0]}x{map_size[1]}',
-            r=overlay_fps,
-        )
-        .output(
-            output_path,
-            vcodec='prores_ks',
-            profile='4444',
-            pix_fmt='yuva444p10le',
-            r=overlay_fps,
-        )
+        .input('pipe:', format='rawvideo', pix_fmt='rgba', 
+               s=f'{map_size[0]}x{map_size[1]}', r=overlay_fps)
+        .output(output_path, vcodec='prores_ks', profile='4444', 
+                pix_fmt='yuva444p10le', r=overlay_fps)
         .overwrite_output()
         .run_async(pipe_stdin=True)
     )
-
+    
     try:
-        # Generate frames sequentially and write them to the pipe
         for frame_num in range(total_frames):
             frame_time = track_points[0].timestamp + timedelta(seconds=frame_num * frame_duration)
             interpolated_point = get_interpolated_gps_point(track_points, frame_time)
             
-            # Create a new image for the map
-            map_image = Image.new('RGBA', map_size, (0, 0, 0, 0))
-            draw = ImageDraw.Draw(map_image)
+            # Create Cairo surface
+            surface = cairo.ImageSurface(cairo.FORMAT_ARGB32, map_size[0], map_size[1])
+            ctx = cairo.Context(surface)
+            
+            # Clear with transparent background
+            ctx.set_source_rgba(0, 0, 0, 0)
+            ctx.paint()
             
             def lat_lon_to_pixel(lat: float, lon: float) -> tuple:
-                """Convert latitude/longitude to pixel coordinates."""
-                x = int((lon - min_lon) / (max_lon - min_lon) * map_size[0])
-                y = int((1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1])
+                x = (lon - min_lon) / (max_lon - min_lon) * map_size[0]
+                y = (1 - (lat - min_lat) / (max_lat - min_lat)) * map_size[1]
                 return (x, y)
             
-            # Draw the complete track
-            track_points_pixels = [lat_lon_to_pixel(p.latitude, p.longitude) for p in track_points]
-            draw.line(track_points_pixels, fill='blue', width=2)
+            # Draw track with gradient
+            ctx.set_line_width(3)
+            ctx.set_source_rgb(0.2, 0.4, 1.0)
             
-            # Draw the current position
+            # Draw the track
+            for i, point in enumerate(track_points):
+                x, y = lat_lon_to_pixel(point.latitude, point.longitude)
+                if i == 0:
+                    ctx.move_to(x, y)
+                else:
+                    ctx.line_to(x, y)
+            ctx.stroke()
+            
+            # Draw current position with glow effect
             current_pos = lat_lon_to_pixel(interpolated_point.latitude, interpolated_point.longitude)
-            draw.ellipse(
-                (current_pos[0]-8, current_pos[1]-8, current_pos[0]+8, current_pos[1]+8),
-                fill='red',
-                outline='white',
-                width=2
-            )
             
-            # Add GPS information
+            # Glow effect
+            for radius in [20, 15, 10]:
+                ctx.arc(current_pos[0], current_pos[1], radius, 0, 2 * 3.14159)
+                alpha = 0.1 if radius == 20 else 0.2 if radius == 15 else 0.4
+                ctx.set_source_rgba(1, 0, 0, alpha)
+                ctx.fill()
+            
+            # Main dot
+            ctx.arc(current_pos[0], current_pos[1], 6, 0, 2 * 3.14159)
+            ctx.set_source_rgba(1, 1, 1, 1)
+            ctx.fill()
+            
+            # Add text with better typography
+            ctx.select_font_face("Arial", cairo.FONT_SLANT_NORMAL, cairo.FONT_WEIGHT_BOLD)
+            ctx.set_font_size(20)
+            
             info_text = [
                 f"Lat: {interpolated_point.latitude:.6f}°",
                 f"Lon: {interpolated_point.longitude:.6f}°",
                 f"Elev: {interpolated_point.elevation:.1f}m",
-                f"Speed: {calculate_speed_interpolated(interpolated_point, track_points, window_seconds=speed_window):.1f} km/h",
+                f"Speed: {calculate_speed_interpolated(interpolated_point, track_points, speed_window):.1f} km/h",
                 f"Time: {interpolated_point.timestamp.strftime('%H:%M:%S')}"
             ]
             
-            # Draw text with black outline for better visibility
             for i, text in enumerate(info_text):
-                y_pos = 10 + i * 30
-                # Draw black outline
-                for offset_x, offset_y in [(-1,-1), (-1,1), (1,-1), (1,1)]:
-                    draw.text((12 + offset_x, y_pos + offset_y), text, font=font, fill='black')
-                # Draw white text
-                draw.text((12, y_pos), text, font=font, fill='white')
+                y_pos = 30 + i * 25
+                # Text shadow
+                ctx.move_to(13, y_pos + 1)
+                ctx.set_source_rgba(0, 0, 0, 0.8)
+                ctx.show_text(text)
+                # Main text
+                ctx.move_to(12, y_pos)
+                ctx.set_source_rgba(1, 1, 1, 1)
+                ctx.show_text(text)
             
-            # Write the frame to the pipe
-            process.stdin.write(map_image.tobytes())
+            # Convert Cairo surface to bytes
+            buf = surface.get_data()
+            img_array = np.ndarray(shape=(map_size[1], map_size[0], 4), 
+                                 dtype=np.uint8, buffer=buf)
+            # Cairo uses BGRA, convert to RGBA
+            img_array = img_array[:, :, [2, 1, 0, 3]]
             
-            # Print progress
+            # Write frame
+            process.stdin.write(img_array.tobytes())
+            
             progress = (frame_num + 1) / total_frames * 100
             print(f"\rGenerating overlay video: {progress:.1f}%", end='', flush=True)
         
-        print()  # Add newline after progress is complete
-        
-        # Close the pipe and wait for FFmpeg to finish
+        print()
         process.stdin.close()
         process.wait()
         
-        if process.returncode != 0:
-            raise RuntimeError(f"FFmpeg process exited with code {process.returncode}")
-            
     except Exception as e:
         process.stdin.close()
         process.wait()

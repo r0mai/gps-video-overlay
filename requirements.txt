@@ -1,3 +1,5 @@
 ffmpeg-python
 gpxpy
 Pillow
+pycairo
+numpy
