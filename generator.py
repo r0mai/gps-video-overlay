@@ -274,7 +274,7 @@ def main():
     parser.add_argument('--speed-window', type=float, default=5.0, help='Time window (in seconds) over which to average the displayed speed')
     parser.add_argument('--overlay-fps', type=float, default=5.0, help='Frame rate (frames per second) for the generated overlay video')
     parser.add_argument('--tile-style', default='none', 
-                       choices=['none', 'osm', 'cyclosm', 'cyclosm-lite', 'humanitarian', 'osmfr', 'opentopomap', 'stamen-toner', 'stamen-watercolor'],
+                       choices=['none', 'osm', 'cyclosm', 'humanitarian', 'osmfr', 'opentopomap', 'stamen-toner', 'stamen-watercolor'],
                        help='Map tile style to use (default: none)')
     
     args = parser.parse_args()

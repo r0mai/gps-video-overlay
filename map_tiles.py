@@ -22,12 +22,6 @@ class MapTileProvider:
             'attribution': '© CyclOSM, © OpenStreetMap contributors',
             'max_zoom': 20
         },
-        'cyclosm-lite': {
-            'name': 'CyclOSM Lite (Cycling Overlay)',
-            'url': 'https://a.tile-cyclosm.openstreetmap.fr/cyclosm-lite/{z}/{x}/{y}.png',
-            'attribution': '© CyclOSM, © OpenStreetMap contributors',
-            'max_zoom': 20
-        },
         'humanitarian': {
             'name': 'Humanitarian',
             'url': 'https://a.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png',
