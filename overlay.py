@@ -344,7 +344,7 @@ def generate_heightmap_video(
     chart_size: tuple = (800, 400),
     overlay_fps: float = 5.0,
 ) -> None:
-    """Generate elevation profile overlay showing height vs time with current position indicator."""
+    """Generate elevation profile overlay showing height vs distance with current position indicator."""
     
     frame_duration = 1.0 / overlay_fps
     
@@ -364,12 +364,30 @@ def generate_heightmap_video(
     min_elevation -= elevation_padding
     max_elevation += elevation_padding
     
-    # Calculate time bounds
+    # Calculate cumulative distances
+    from math import radians, sin, cos, sqrt, atan2
+    
+    def haversine(lat1, lon1, lat2, lon2):
+        R = 6371  # km
+        dlat = radians(lat2 - lat1)
+        dlon = radians(lon2 - lon1)
+        a = sin(dlat / 2) ** 2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2
+        return 2 * R * atan2(sqrt(a), sqrt(1 - a))
+    
+    cumulative_distances = [0.0]  # Start at 0 km
+    for i in range(1, len(track_points)):
+        prev_point = track_points[i-1]
+        curr_point = track_points[i]
+        distance = haversine(prev_point.latitude, prev_point.longitude, 
+                           curr_point.latitude, curr_point.longitude)
+        cumulative_distances.append(cumulative_distances[-1] + distance)
+    
+    total_distance = cumulative_distances[-1]
+    
+    # Calculate time bounds for frame generation
     start_time = track_points[0].timestamp
     end_time = track_points[-1].timestamp
-    total_duration = (end_time - start_time).total_seconds()
-    
-    gps_duration = (track_points[-1].timestamp - track_points[0].timestamp).total_seconds()
+    gps_duration = (end_time - start_time).total_seconds()
     total_frames = int(gps_duration * overlay_fps + 0.5)
     
     # Chart margins
@@ -405,9 +423,8 @@ def generate_heightmap_video(
             ctx.paint()
             
             # Helper functions for coordinate conversion
-            def time_to_x(timestamp: datetime) -> float:
-                time_offset = (timestamp - start_time).total_seconds()
-                return margin_left + (time_offset / total_duration) * chart_width
+            def distance_to_x(distance: float) -> float:
+                return margin_left + (distance / total_distance) * chart_width
             
             def elevation_to_y(elevation: float) -> float:
                 normalized = (elevation - min_elevation) / (max_elevation - min_elevation)
@@ -417,7 +434,7 @@ def generate_heightmap_video(
             ctx.set_line_width(1)
             ctx.set_source_rgba(0.3, 0.3, 0.3, 0.8)
             
-            # Vertical grid lines (time)
+            # Vertical grid lines (distance)
             for i in range(6):  # 5 intervals
                 x = margin_left + (i / 5) * chart_width
                 ctx.move_to(x, margin_top)
@@ -439,7 +456,7 @@ def generate_heightmap_video(
                 if point.elevation is None:
                     continue
                     
-                x = time_to_x(point.timestamp)
+                x = distance_to_x(cumulative_distances[i])
                 y = elevation_to_y(point.elevation)
                 
                 if i == 0:
@@ -448,11 +465,27 @@ def generate_heightmap_video(
                     ctx.line_to(x, y)
             ctx.stroke()
             
+            # Calculate current distance for the interpolated point
+            # Find the two points that bracket the current time
+            idx = bisect.bisect_left([p.timestamp for p in track_points], frame_time)
+            if idx == 0:
+                current_distance = 0.0
+            elif idx >= len(track_points):
+                current_distance = total_distance
+            else:
+                # Interpolate distance
+                prev_point = track_points[idx-1]
+                next_point = track_points[idx]
+                time_ratio = (frame_time - prev_point.timestamp).total_seconds() / \
+                            (next_point.timestamp - prev_point.timestamp).total_seconds()
+                current_distance = cumulative_distances[idx-1] + \
+                                 (cumulative_distances[idx] - cumulative_distances[idx-1]) * time_ratio
+            
             # Draw current position indicator
-            current_x = time_to_x(interpolated_point.timestamp)
+            current_x = distance_to_x(current_distance)
             current_y = elevation_to_y(interpolated_point.elevation)
             
-            # Vertical line at current time
+            # Vertical line at current position
             ctx.set_line_width(2)
             ctx.set_source_rgba(1, 0, 0, 0.8)  # Red line
             ctx.move_to(current_x, margin_top)
@@ -499,22 +532,19 @@ def generate_heightmap_video(
                 ctx.move_to(margin_left - text_extents.width - 10, y + text_extents.height / 2)
                 ctx.show_text(label)
             
-            # X-axis labels (time)
+            # X-axis labels (distance)
             for i in range(6):
-                time_offset = (i / 5) * total_duration
-                timestamp = start_time + timedelta(seconds=time_offset)
+                distance = (i / 5) * total_distance
                 x = margin_left + (i / 5) * chart_width
-                label = timestamp.strftime('%H:%M')
+                label = f"{distance:.1f}km"
                 
                 text_extents = ctx.text_extents(label)
                 ctx.move_to(x - text_extents.width / 2, margin_top + chart_height + 20)
                 ctx.show_text(label)
             
             # Current info
-            
-            # Current elevation info
             ctx.set_font_size(14)
-            current_info = f"Current: {interpolated_point.elevation:.1f}m at {interpolated_point.timestamp.strftime('%H:%M:%S')}"
+            current_info = f"Current: {interpolated_point.elevation:.1f}m at {current_distance:.1f}km"
             text_extents = ctx.text_extents(current_info)
             ctx.move_to(chart_size[0] - text_extents.width - 10, chart_size[1] - 10)
             ctx.show_text(current_info)
