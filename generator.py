@@ -11,10 +11,6 @@ import os
 from typing import List
 import bisect
 import os
-from multiprocessing import Pool, cpu_count
-from functools import partial
-import select
-import sys
 
 @dataclass
 class VideoMetadata:
